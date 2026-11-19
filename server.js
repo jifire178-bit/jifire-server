@@ -84,6 +84,17 @@ const CFG = {
     brands: env('HYPERPAY_BRANDS', 'VISA MASTER'),
     testMode: env('HYPERPAY_TEST_MODE'), // EXTERNAL / INTERNAL on test host only
   },
+  otp: {
+    authkey: env('MSG91_AUTHKEY'),
+    templateId: env('MSG91_TEMPLATE_ID'),
+    host: env('MSG91_HOST', 'https://control.msg91.com').replace(/\/+$/, ''),
+    length: Number(env('OTP_LENGTH', '6')),
+    expiryMin: Number(env('OTP_EXPIRY_MIN', '5')),
+    // Optional fixed test number (e.g. for Google Play review). Leave empty in normal use.
+    testPhone: env('OTP_TEST_PHONE'),
+    testCode: env('OTP_TEST_CODE'),
+    sessionDays: Number(env('SESSION_DAYS', '90')),
+  },
   dataDir: env('DATA_DIR', path.join(__dirname, 'data')),
   ordersPerIp: Number(env('ORDERS_PER_IP_10MIN', '6')),
 };
@@ -477,6 +488,115 @@ async function hyperpayStatus(checkoutId) {
   return res.json().catch(() => ({}));
 }
 
+// ------------------------------------------------------------ otp login ---
+
+const otpEnabled = () =>
+  Boolean((CFG.otp.authkey && CFG.otp.templateId) || (CFG.otp.testPhone && CFG.otp.testCode));
+
+const SESSION_SECRET = (() => {
+  const fromEnv = env('SESSION_SECRET');
+  if (fromEnv) return fromEnv;
+  const f = path.join(CFG.dataDir, 'session.key');
+  try {
+    return fs.readFileSync(f, 'utf8').trim();
+  } catch {
+    const k = crypto.randomBytes(32).toString('hex');
+    fs.mkdirSync(CFG.dataDir, { recursive: true });
+    fs.writeFileSync(f, k, { mode: 0o600 });
+    return k;
+  }
+})();
+
+function signSession(phone) {
+  const body = Buffer.from(
+    JSON.stringify({ p: phone, e: Date.now() + CFG.otp.sessionDays * 864e5 })
+  ).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function readSession(req) {
+  const h = String(req.headers.authorization || '');
+  const tok = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  const [body, sig] = tok.split('.');
+  if (!body || !sig) return null;
+  const want = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(want);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const s = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return s.e > Date.now() && typeof s.p === 'string' ? s.p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** +9647XXXXXXXXX -> 9647XXXXXXXXX (MSG91 format: country code, no +) */
+const msg91Mobile = (phone) => phone.replace(/^\+/, '');
+
+async function msg91(method, pathQs) {
+  const res = await fetch(`${CFG.otp.host}${pathQs}`, {
+    method,
+    headers: { authkey: CFG.otp.authkey, accept: 'application/json', 'content-type': 'application/json' },
+  });
+  const json = await res.json().catch(() => ({}));
+  return json;
+}
+
+async function handleOtpSend(body, ip) {
+  if (!otpEnabled()) throw new AppError(400, 'تسجيل الدخول برمز التحقق غير مفعّل');
+  const phone = normalizePhone(body?.phone);
+  if (!phone) throw new AppError(400, 'رقم الهاتف غير صحيح، مثال: 07701234567');
+  rateLimit(ip, 'otp-send-ip', Number(env('OTP_SENDS_PER_IP_10MIN', '10')), 10 * 60e3);
+  rateLimit(phone, 'otp-send', 3, 10 * 60e3);
+  if (CFG.otp.testPhone && normalizePhone(CFG.otp.testPhone) === phone) return { ok: true };
+
+  const retry = body?.resend === true;
+  const q = new URLSearchParams({ mobile: msg91Mobile(phone) });
+  let r;
+  if (retry) {
+    q.set('retrytype', 'text');
+    r = await msg91('GET', `/api/v5/otp/retry?${q}`);
+  }
+  if (!retry || r?.type !== 'success') {
+    q.delete('retrytype');
+    q.set('template_id', CFG.otp.templateId);
+    q.set('otp_length', String(CFG.otp.length));
+    q.set('otp_expiry', String(CFG.otp.expiryMin));
+    r = await msg91('POST', `/api/v5/otp?${q}`);
+  }
+  if (r?.type !== 'success') {
+    log('msg91 send failed', JSON.stringify(r).slice(0, 300));
+    throw new AppError(502, 'تعذّر إرسال رمز التحقق، حاول بعد قليل');
+  }
+  return { ok: true };
+}
+
+async function handleOtpVerify(body, ip) {
+  if (!otpEnabled()) throw new AppError(400, 'تسجيل الدخول برمز التحقق غير مفعّل');
+  const phone = normalizePhone(body?.phone);
+  const code = String(body?.code || '').replace(/[٠-٩]/g, (c) => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/\D/g, '');
+  if (!phone || code.length < 4 || code.length > 8) throw new AppError(400, 'أدخل رمز التحقق');
+  rateLimit(ip, 'otp-verify-ip', Number(env('OTP_SENDS_PER_IP_10MIN', '10')) * 2, 10 * 60e3);
+  rateLimit(phone, 'otp-verify', 6, 10 * 60e3);
+
+  let ok;
+  if (CFG.otp.testPhone && normalizePhone(CFG.otp.testPhone) === phone) {
+    ok = code === CFG.otp.testCode;
+  } else {
+    const q = new URLSearchParams({ otp: code, mobile: msg91Mobile(phone) });
+    const r = await msg91('GET', `/api/v5/otp/verify?${q}`);
+    ok = r?.type === 'success';
+    if (!ok) log('msg91 verify failed', JSON.stringify(r).slice(0, 200));
+    if (!ok && /expired/i.test(String(r?.message))) {
+      throw new AppError(400, 'انتهت صلاحية الرمز، اطلب رمزاً جديداً');
+    }
+  }
+  if (!ok) throw new AppError(400, 'رمز التحقق غير صحيح');
+  return { token: signSession(phone), phone, expiresInDays: CFG.otp.sessionDays };
+}
+
 // ---------------------------------------------------------- validation ---
 
 class AppError extends Error {
@@ -577,6 +697,7 @@ setInterval(() => {
 async function handleConfig() {
   return {
     currency: 'IQD',
+    auth: { otpRequired: otpEnabled(), channel: 'sms' },
     governorates: IRAQ_GOVERNORATES,
     delivery: {
       defaultFee: CFG.defaultDeliveryFee,
@@ -596,8 +717,11 @@ async function handleConfig() {
   };
 }
 
-async function handleOrder(body, ip) {
+async function handleOrder(body, ip, sessionPhone) {
+  if (otpEnabled() && !sessionPhone) throw new AppError(401, 'سجّل الدخول برقم هاتفك أولاً');
   const order = validateOrder(body);
+  // The verified number is the order's phone, whatever the form says.
+  if (sessionPhone) order.customer.phone = sessionPhone;
 
   const prior = state.idempotency[order.idempotencyKey];
   if (prior) return prior.result;
@@ -739,6 +863,81 @@ async function handlePayResult(token) {
   }
 }
 
+
+// ------------------------------------------------------------ admin page ---
+// A small settings page so keys can be changed from a phone browser without
+// logging into the server. Password: the Shopify Client secret.
+
+const EDITABLE = [
+  ['MSG91_AUTHKEY', 'MSG91 Authkey', true],
+  ['MSG91_TEMPLATE_ID', 'MSG91 OTP Template ID', false],
+  ['OTP_TEST_PHONE', 'رقم تجربة (اختياري)', false],
+  ['OTP_TEST_CODE', 'رمز تجربة (اختياري)', true],
+  ['HYPERPAY_HOST', 'HyperPay Host', false],
+  ['HYPERPAY_ENTITY_ID', 'HyperPay Entity ID', false],
+  ['HYPERPAY_ACCESS_TOKEN', 'HyperPay Access Token', true],
+  ['HYPERPAY_CURRENCY', 'HyperPay Currency', false],
+  ['HYPERPAY_RATE', 'HyperPay Rate', false],
+  ['HYPERPAY_BRANDS', 'HyperPay Brands', false],
+  ['DELIVERY_FEE', 'أجرة التوصيل الافتراضية', false],
+  ['DELIVERY_FEES', 'أجور المحافظات (بغداد:5000,البصرة:7000)', false],
+  ['FREE_DELIVERY_OVER', 'توصيل مجاني فوق مبلغ', false],
+  ['PICKUP_ENABLED', 'الاستلام من المتجر (true/false)', false],
+  ['PICKUP_ADDRESS', 'عنوان المتجر', false],
+  ['PICKUP_HOURS', 'أوقات الدوام', false],
+  ['COD_ENABLED', 'الدفع عند الاستلام (true/false)', false],
+  ['AQSATI_ENABLED', 'أقساطي (true/false)', false],
+];
+
+function adminPassOk(given) {
+  const want = CFG.clientSecret || CFG.staticToken;
+  if (!want || typeof given !== 'string' || !given) return false;
+  const a = crypto.createHash('sha256').update(given).digest();
+  const b = crypto.createHash('sha256').update(want).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function adminPage(msg = '', ok = false) {
+  const rows = EDITABLE.map(([k, label, secret]) => {
+    const cur = process.env[k] || '';
+    const shown = secret ? (cur ? '•••• محفوظ' : '') : cur;
+    return `<label>${escapeHtml(label)}<small>${escapeHtml(k)}</small>
+<input name="${k}" placeholder="${escapeHtml(shown)}" ${secret ? 'type="password" autocomplete="new-password"' : ''}></label>`;
+  }).join('');
+  return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>إعدادات خادم جي فاير</title>
+<style>body{margin:0;background:#0A0A0C;color:#F5F5F7;font-family:system-ui,Tahoma,sans-serif}
+.w{max-width:560px;margin:0 auto;padding:20px}h1{font-size:22px}label{display:block;margin:14px 0;font-weight:700}
+small{display:block;color:#8E8E96;font-weight:400;direction:ltr;text-align:right}
+input{width:100%;box-sizing:border-box;margin-top:6px;padding:12px;border-radius:12px;border:1px solid #2A2A30;background:#1D1D21;color:#fff;font-size:15px}
+button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;font-weight:800;font-size:16px;margin-top:10px}
+.m{padding:12px;border-radius:12px;margin:10px 0;background:${ok ? '#123d26' : '#3d1212'}}
+.st{background:#141417;border:1px solid #2A2A30;border-radius:14px;padding:12px;line-height:1.9}</style></head>
+<body><div class="w"><h1>إعدادات خادم جي فاير</h1>
+<div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+تسجيل الدخول برمز SMS: <b>${otpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
+${msg ? `<div class="m">${escapeHtml(msg)}</div>` : ''}
+<form method="post" action="/admin">
+<label>كلمة المرور<small>Shopify Client secret</small><input name="__pass" type="password" required></label>
+<p style="color:#8E8E96">اترك أي خانة فارغة حتى لا تتغير قيمتها. اكتب <b dir="ltr">-</b> لمسح قيمة.</p>
+${rows}<button>حفظ وإعادة تشغيل الخادم</button></form></div></body></html>`;
+}
+
+function saveEnv(changes) {
+  const file = path.join(__dirname, '.env');
+  let lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/) : [];
+  for (const [k, v] of Object.entries(changes)) {
+    const clean = String(v).replace(/[\r\n]/g, '').trim();
+    const line = `${k}=${clean}`;
+    const i = lines.findIndex((l) => l.startsWith(`${k}=`));
+    if (i >= 0) lines[i] = line;
+    else lines.push(line);
+  }
+  fs.writeFileSync(file + '.tmp', lines.join('\n'), { mode: 0o600 });
+  fs.renameSync(file + '.tmp', file);
+}
+
 // ---------------------------------------------------------------- server ---
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -804,7 +1003,51 @@ const server = http.createServer(async (req, res) => {
       } catch {
         throw new AppError(400, 'طلب غير صالح');
       }
-      return send(res, 200, await handleOrder(body, clientIp(req)));
+      return send(res, 200, await handleOrder(body, clientIp(req), readSession(req)));
+    }
+
+    if (req.method === 'POST' && (p === '/api/auth/otp/send' || p === '/api/auth/otp/verify')) {
+      checkAppKey(req);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, 4096));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      const fn = p.endsWith('/send') ? handleOtpSend : handleOtpVerify;
+      return send(res, 200, await fn(body, clientIp(req)));
+    }
+
+    if (req.method === 'GET' && p === '/api/auth/me') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      return send(res, 200, { phone });
+    }
+
+    if (p === '/admin' && req.method === 'GET') {
+      return send(res, 200, adminPage(), 'text/html; charset=utf-8');
+    }
+    if (p === '/admin' && req.method === 'POST') {
+      rateLimit(clientIp(req), 'admin', 8, 10 * 60e3);
+      const form = new URLSearchParams(await readBody(req, 16 * 1024));
+      if (!adminPassOk(form.get('__pass'))) {
+        return send(res, 401, adminPage('كلمة المرور غير صحيحة'), 'text/html; charset=utf-8');
+      }
+      const changes = {};
+      for (const [k] of EDITABLE) {
+        const v = (form.get(k) || '').trim();
+        if (v) changes[k] = v === '-' ? '' : v;
+      }
+      if (!Object.keys(changes).length) {
+        return send(res, 200, adminPage('لم يتغير شيء', true), 'text/html; charset=utf-8');
+      }
+      saveEnv(changes);
+      log('admin: settings changed', Object.keys(changes).join(','));
+      send(res, 200, adminPage('تم الحفظ ✅ الخادم يعيد التشغيل الآن، حدّث الصفحة بعد 5 ثوانٍ.', true), 'text/html; charset=utf-8');
+      // systemd (Restart=always) starts it again with the new settings.
+      setTimeout(() => process.exit(0), 500);
+      return;
     }
 
     let m;
@@ -861,8 +1104,8 @@ if (require.main === module) {
   if (missing.length) console.warn('⚠️  Missing settings:', missing.join(', '));
   if (!CFG.appKey) console.warn('⚠️  APP_KEY is empty: anyone can call /api/orders');
   server.listen(CFG.port, () => {
-    log(`Ji Fire order server on :${CFG.port} | card payments: ${hyperpayEnabled() ? 'on' : 'off'}`);
+    log(`Ji Fire order server on :${CFG.port} | card payments: ${hyperpayEnabled() ? 'on' : 'off'} | OTP login: ${otpEnabled() ? 'on' : 'off'}`);
   });
 }
 
-module.exports = { server, normalizePhone, validateOrder, parseFees, CFG };
+module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession };
