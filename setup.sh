@@ -111,7 +111,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now jifire-orders
+systemctl enable jifire-orders >/dev/null 2>&1
+systemctl restart jifire-orders
 systemctl enable caddy >/dev/null 2>&1
 systemctl restart caddy
 

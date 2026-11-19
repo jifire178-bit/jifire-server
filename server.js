@@ -189,7 +189,14 @@ async function admin(query, variables = {}) {
     }
     if (!res.ok || json.errors) {
       log('admin error', res.status, JSON.stringify(json.errors || json).slice(0, 800));
-      throw new AppError(502, 'خطأ من إدارة المتجر، حاول مرة أخرى');
+      const err = new AppError(502, 'خطأ من إدارة المتجر، حاول مرة أخرى');
+      err.shopify = (json.errors || []).map((e) => ({
+        message: String(e?.message || ''),
+        code: e?.extensions?.code || '',
+        path: (e?.path || []).join('.'),
+      }));
+      if (!err.shopify.length) err.shopify = [{ message: `HTTP ${res.status}`, code: '', path: '' }];
+      throw err;
     }
     return json.data;
   }
@@ -342,21 +349,69 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review }) {
     sendReceipt: CFG.sendReceipt && Boolean(order.customer.email),
   };
 
-  let data = await admin(ORDER_CREATE, { order: input, options });
-  let errs = data.orderCreate.userErrors;
-  if (errs.length && input.customer) {
-    // Customer upsert can fail (e.g. phone used by another customer); retry without it.
-    log('orderCreate retry without customer', JSON.stringify(errs));
-    delete input.customer;
-    data = await admin(ORDER_CREATE, { order: input, options });
-    errs = data.orderCreate.userErrors;
-  }
-  if (errs.length) {
+  // Shopify may refuse protected customer fields (name/phone/address) or the
+  // customer upsert depending on the app type and store plan. Try the full
+  // order first, then progressively simpler versions so the order always
+  // lands in admin with every detail visible.
+  const contact = [
+    ['الاسم', order.customer.name],
+    ['الهاتف', order.customer.phone],
+    ...(order.customer.email ? [['البريد', order.customer.email]] : []),
+    ...(address
+      ? [
+          ['المحافظة', order.address.governorate],
+          ['المنطقة', order.address.area],
+          ...(order.address.street ? [['الشارع', order.address.street]] : []),
+          ...(order.address.landmark ? [['أقرب نقطة دالة', order.address.landmark]] : []),
+        ]
+      : []),
+  ];
+  const withoutCustomer = () => {
+    const c = { ...input };
+    delete c.customer;
+    return c;
+  };
+  const withoutProtected = () => {
+    const c = withoutCustomer();
+    delete c.shippingAddress;
+    delete c.billingAddress;
+    delete c.phone;
+    delete c.email;
+    c.customAttributes = [...attrs, ...contact.map(([key, value]) => ({ key, value }))];
+    c.note = [contact.map(([k, v]) => `${k}: ${v}`).join('\n'), order.note].filter(Boolean).join('\n\n');
+    c.tags = [...tags, 'بيانات الزبون في الملاحظات'];
+    return c;
+  };
+  const attempts = [input, ...(input.customer ? [withoutCustomer()] : []), withoutProtected()];
+
+  let data = null;
+  let lastErr = null;
+  for (const attempt of attempts) {
+    try {
+      data = await admin(ORDER_CREATE, { order: attempt, options });
+    } catch (e) {
+      if (!e.shopify) throw e; // network/throttle: no point retrying here
+      lastErr = e;
+      log('orderCreate attempt failed', JSON.stringify(e.shopify).slice(0, 600));
+      data = null;
+      continue;
+    }
+    const errs = data.orderCreate.userErrors;
+    if (!errs.length) break;
     log('orderCreate userErrors', JSON.stringify(errs));
     const msg = errs.map((e) => e.message).join('، ');
-    throw new AppError(422, /inventory|stock|available/i.test(msg)
-      ? 'الكمية المطلوبة غير متوفرة حالياً'
-      : 'تعذّر إنشاء الطلب: ' + msg);
+    if (/inventory|stock|available/i.test(msg)) {
+      throw new AppError(422, 'الكمية المطلوبة غير متوفرة حالياً');
+    }
+    lastErr = new AppError(422, 'تعذّر إنشاء الطلب: ' + msg);
+    data = null;
+  }
+  if (!data) {
+    const detail = lastErr?.shopify
+      ? lastErr.shopify.map((x) => `${x.code || ''} ${x.message}`.trim()).join(' | ').slice(0, 300)
+      : '';
+    throw new AppError(lastErr?.status || 502,
+      (lastErr?.message || 'خطأ من إدارة المتجر') + (detail ? ` (${detail})` : ''));
   }
   const o = data.orderCreate.order;
   return { orderId: o.id, orderName: o.name, total, deliveryFee: fee, currency: priced.currency };
