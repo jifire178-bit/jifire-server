@@ -11,7 +11,12 @@ APP_DIR=/opt/jifire-orders
 NODE_VERSION=22.12.0
 
 say() { printf '\n\033[1;33m==> %s\033[0m\n' "$*"; }
-ask() { local v; read -r -p "$1" v < /dev/tty; echo "$v"; }
+# Values can come from the environment (EC2 User data) or be typed in.
+ask() {
+  local v=""
+  if [ -r /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then read -r -p "$1" v < /dev/tty || true; fi
+  echo "$v"
+}
 
 [ "$(id -u)" = 0 ] || { echo "Run with sudo"; exit 1; }
 
@@ -49,12 +54,19 @@ DOMAIN_DEFAULT="$(echo "$IP" | tr . -).sslip.io"
 if [ -f "$APP_DIR/.env" ]; then
   echo "Existing .env kept ($APP_DIR/.env)."
   DOMAIN=$(grep '^PUBLIC_URL=' "$APP_DIR/.env" | sed 's#PUBLIC_URL=https://##')
+  # Automatic sslip.io address: follow the server's current IP.
+  if [ -z "${JF_DOMAIN:-}" ] && [[ "$DOMAIN" == *.sslip.io ]] && [ "$DOMAIN" != "$DOMAIN_DEFAULT" ]; then
+    DOMAIN=$DOMAIN_DEFAULT
+    sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=https://$DOMAIN#" "$APP_DIR/.env"
+    echo "IP changed: new link https://$DOMAIN"
+  fi
 else
   echo "Server IP: $IP"
-  DOMAIN=$(ask "Domain (Enter = $DOMAIN_DEFAULT): ")
+  DOMAIN=${JF_DOMAIN:-$(ask "Domain (Enter = $DOMAIN_DEFAULT): ")}
   DOMAIN=${DOMAIN:-$DOMAIN_DEFAULT}
-  CID=$(ask "Shopify Client ID: ")
-  CSECRET=$(ask "Shopify Client secret: ")
+  CID=${SHOPIFY_CLIENT_ID:-$(ask "Shopify Client ID: ")}
+  CSECRET=${SHOPIFY_CLIENT_SECRET:-$(ask "Shopify Client secret: ")}
+  if [ -z "$CID" ] || [ -z "$CSECRET" ]; then echo "Missing Shopify Client ID/secret"; exit 1; fi
   cp "$APP_DIR/env.example" "$APP_DIR/.env"
   sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=https://$DOMAIN#" "$APP_DIR/.env"
   sed -i "s#^SHOPIFY_CLIENT_ID=.*#SHOPIFY_CLIENT_ID=$CID#" "$APP_DIR/.env"
