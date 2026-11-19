@@ -1,0 +1,12 @@
+{
+  "name": "jifire-order-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ji Fire app checkout: creates Shopify orders, HyperPay card payments",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/integration.test.js"
+  }
+}
