@@ -330,7 +330,8 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: 'القسط الشهري', value: String(aqsati.plan.perMonth) },
       { key: 'رقم حساب أقساطي', value: String(aqsati.identity) }
     );
-    tags.push('osp: تم الدفع عن طريق اقساطي بنجاح');
+    if (aqsatiDemo()) tags.push('تجربة أقساطي – ليس حقيقياً');
+    else tags.push('osp: تم الدفع عن طريق اقساطي بنجاح');
   }
 
   const input = {
@@ -339,6 +340,8 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       variantId: i.variantId,
       quantity: i.quantity,
       priceSet: money(i.price),
+      // Without this Shopify marks app orders "Shipping not required".
+      requiresShipping: !pickup,
     })),
     phone: order.customer.phone,
     email: order.customer.email || null,
@@ -624,10 +627,29 @@ async function handleOtpVerify(body, ip) {
 // Aqsati page, but the Shopify order is created only after the installment
 // is approved.
 
+const aqsatiDemo = () => CFG.aqsati.apiBase.toLowerCase() === 'demo';
 const aqsatiEnabled = () =>
-  CFG.aqsati.enabled && Boolean(CFG.aqsati.apiBase && CFG.aqsati.merchantKey);
+  CFG.aqsati.enabled && (aqsatiDemo() || Boolean(CFG.aqsati.apiBase && CFG.aqsati.merchantKey));
+
+/** Demo mode (AQSATI_API_BASE_URL=demo): simulated Aqsati answers for trying the app. */
+function aqsatiDemoAnswer(pathName, body) {
+  if (pathName === '/GetCustomerInformation') {
+    if (String(body.Identity) === '0000') throw new AppError(400, 'الحساب غير موجود (تجربة)');
+    return {
+      session: { sessionId: 'DEMO-' + crypto.randomBytes(4).toString('hex') },
+      merchantInformation: { productInformation: { minCountOfMonth: 3, maxCountOfMonth: 24, repaymentLimit: 500000 } },
+    };
+  }
+  if (pathName === '/ValidatorOfInstallment') return { message: 'ok' };
+  if (pathName === '/CreateInstallment') {
+    if (Number(body.OTP) !== 1234) throw new AppError(400, 'رمز التحقق غير صحيح (رمز التجربة 1234)');
+    return { installmentId: 'DEMO' + Date.now().toString().slice(-6), operationId: 'DEMO' };
+  }
+  return {};
+}
 
 async function aqsatiPost(pathName, body) {
+  if (aqsatiDemo()) return aqsatiDemoAnswer(pathName, body);
   let res;
   try {
     res = await fetch(`${CFG.aqsati.apiBase}${pathName}`, {
@@ -1058,7 +1080,7 @@ const EDITABLE = [
   ['PICKUP_HOURS', 'أوقات الدوام', false],
   ['COD_ENABLED', 'الدفع عند الاستلام (true/false)', false],
   ['AQSATI_ENABLED', 'أقساطي (true/false)', false],
-  ['AQSATI_API_BASE_URL', 'رابط API أقساطي (تجريبي أو حقيقي)', false],
+  ['AQSATI_API_BASE_URL', 'رابط API أقساطي (أو demo للتجربة بدون مفاتيح)', false],
   ['AQSATI_MERCHANT_KEY', 'مفتاح التاجر لأقساطي', true],
   ['AQSATI_PLANS', 'خطط التقسيط أشهر:نسبة (10:25,18:40)', false],
 ];
@@ -1090,7 +1112,7 @@ button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;fo
 <body><div class="w"><h1>إعدادات خادم جي فاير</h1>
 <div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 تسجيل الدخول برمز SMS: <b>${otpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
-أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(CFG.aqsati.apiBase ? new URL(CFG.aqsati.apiBase).host : '')}</span><br>
+أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(aqsatiDemo() ? '(وضع تجربة)' : (() => { try { return new URL(CFG.aqsati.apiBase).host; } catch { return ''; } })())}</span><br>
 عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
 ${msg ? `<div class="m">${escapeHtml(msg)}</div>` : ''}
 <form method="post" action="/admin">
