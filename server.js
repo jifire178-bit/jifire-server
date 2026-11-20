@@ -40,7 +40,24 @@ const bool = (k, d = false) => {
   return v === '' ? d : /^(1|true|yes|on)$/i.test(v);
 };
 
+const num = (k, d) => {
+  const v = Number(env(k, String(d)));
+  return Number.isFinite(v) && v >= 0 ? v : d;
+};
+
 const CFG = {
+  // Loyalty points: earned on delivered orders, spent as a discount at checkout.
+  loyalty: {
+    enabled: bool('LOYALTY_ENABLED', true),
+    per1000: num('LOYALTY_POINTS_PER_1000', 1), // points per 1,000 IQD of the order (after discounts, no delivery)
+    minOrder: num('LOYALTY_MIN_ORDER', 10000), // smallest order that earns points
+    pointValue: num('LOYALTY_POINT_VALUE', 10), // IQD per point when spent
+    minRedeem: num('LOYALTY_MIN_REDEEM', 500), // points needed before spending
+    maxRedeemPct: num('LOYALTY_MAX_REDEEM_PCT', 30), // max % of the products total paid with points
+    referrer: num('LOYALTY_REFERRER_POINTS', 500), // to the inviter, after the friend's first delivered order
+    friend: num('LOYALTY_FRIEND_POINTS', 250), // to the invited friend, same moment
+    referralMonthlyCap: num('LOYALTY_REFERRAL_MONTHLY_CAP', 20),
+  },
   port: Number(env('PORT', '8080')),
   publicUrl: env('PUBLIC_URL').replace(/\/+$/, ''),
   appKey: env('APP_KEY'),
@@ -1277,6 +1294,342 @@ if (require.main === module || process.env.ORDER_PUSH_INTERVAL_MS) {
   setInterval(checkFulfilledOrders, Number(env('ORDER_PUSH_INTERVAL_MS', '90000'))).unref();
 }
 
+// ------------------------------------------------------------ loyalty ---
+// Points live on the Shopify customer (metafield jifire_loyalty.ledger), so
+// they survive a server rebuild. Every change is one keyed entry, set by
+// reconciling the order's real state: re-running never double-credits, and
+// cancelling/refunding takes earned points back and returns spent ones.
+//   earn:<order>    points for a delivered order (0 if cancelled/refunded)
+//   redeem:<order>  points spent on an order (back to 0 if it is cancelled)
+//   welcome         invited friend's bonus (after their first delivered order)
+//   ref:<friend>    inviter's bonus for that friend (same moment)
+
+const LOY = CFG.loyalty;
+const LEDGER_GET = `
+query Ledger($id: ID!) {
+  customer(id: $id) {
+    id numberOfOrders
+    metafield(namespace: "jifire_loyalty", key: "ledger") { value }
+  }
+}`;
+const LEDGER_SET = `
+mutation LedgerSet($m: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $m) { userErrors { field message } }
+}`;
+
+const loyaltyLocks = new Map();
+/** One change at a time per customer (no double-spend between two orders). */
+async function withLoyaltyLock(id, fn) {
+  const prev = loyaltyLocks.get(id) || Promise.resolve();
+  let release;
+  const mine = new Promise((r) => (release = r));
+  const tail = prev.then(() => mine);
+  loyaltyLocks.set(id, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (loyaltyLocks.get(id) === tail) loyaltyLocks.delete(id);
+  }
+}
+
+function loyaltyStart() {
+  state.loyalty = state.loyalty || {};
+  if (!state.loyalty.startAt) {
+    // Points count from the day the system goes live (old orders don't earn).
+    state.loyalty.startAt = env('LOYALTY_START_AT') || new Date().toISOString();
+    saveState();
+  }
+  return state.loyalty.startAt;
+}
+
+async function loadLedger(customerId) {
+  const d = await admin(LEDGER_GET, { id: customerId });
+  if (!d.customer) throw new AppError(404, 'الحساب غير موجود');
+  let ledger;
+  try {
+    ledger = JSON.parse(d.customer.metafield?.value || '{}');
+  } catch {
+    ledger = {};
+  }
+  if (!Array.isArray(ledger.entries)) ledger.entries = [];
+  return { ledger, orders: Number(d.customer.numberOfOrders || 0) };
+}
+
+async function saveLedger(customerId, ledger) {
+  ledger.v = 1;
+  ledger.balance = ledgerBalance(ledger);
+  const r = await admin(LEDGER_SET, {
+    m: [
+      { ownerId: customerId, namespace: 'jifire_loyalty', key: 'ledger', type: 'json', value: JSON.stringify(ledger) },
+      { ownerId: customerId, namespace: 'jifire_loyalty', key: 'points', type: 'number_integer', value: String(ledger.balance) },
+    ],
+  });
+  const errs = r.metafieldsSet?.userErrors || [];
+  if (errs.length) throw new Error('ledger save: ' + JSON.stringify(errs).slice(0, 200));
+}
+
+const ledgerBalance = (l) => l.entries.reduce((a, e) => a + (Number(e.p) || 0), 0);
+
+/** Sets entry `k` to `p` points; returns true when something changed. */
+function setEntry(ledger, k, p, info = {}) {
+  p = Math.trunc(p);
+  const e = ledger.entries.find((x) => x.k === k);
+  if (!e) {
+    if (!p) return false;
+    ledger.entries.push({ k, p, at: new Date().toISOString(), ...info });
+    return true;
+  }
+  if (e.p === p) return false;
+  e.p = p;
+  e.upd = new Date().toISOString();
+  Object.assign(e, info);
+  return true;
+}
+
+/** Referral code = customer number in base 36 + 2-char check (no lookup table needed). */
+function referralCode(customerId) {
+  const n = BigInt(String(customerId).split('/').pop());
+  const body = n.toString(36).toUpperCase();
+  return 'JF' + body + refCheck(body);
+}
+function refCheck(body) {
+  const h = crypto.createHash('sha256').update('jifire-ref:' + body).digest();
+  return ((h[0] * 256 + h[1]) % 1296).toString(36).toUpperCase().padStart(2, '0');
+}
+function customerFromCode(code) {
+  const c = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const m = /^JF([0-9A-Z]{1,14})([0-9A-Z]{2})$/.exec(c);
+  if (!m || refCheck(m[1]) !== m[2]) return null;
+  let n = 0n;
+  for (const ch of m[1]) n = n * 36n + BigInt(parseInt(ch, 36));
+  return `gid://shopify/Customer/${n}`;
+}
+
+const orderAttr = (o, key) => (o.customAttributes || []).find((a) => a.key === key)?.value;
+
+/** Points this order should hold right now, from its real state. */
+function orderPointsTarget(o) {
+  const st = orderStep(o);
+  const refunded = ['REFUNDED', 'VOIDED'].includes(o.displayFinancialStatus);
+  const net = Number(o.currentSubtotalPriceSet?.shopMoney?.amount || 0);
+  const started = o.createdAt >= loyaltyStart();
+  const qualifies = started && !refunded && st.step !== 0 && net >= LOY.minOrder;
+  const would = qualifies ? Math.floor((net / 1000) * LOY.per1000) : 0;
+  const spent = Number(orderAttr(o, 'jifire_points_redeemed') || 0);
+  return {
+    earn: st.step === 4 ? would : 0,
+    pending: st.step >= 1 && st.step < 4 ? would : 0,
+    redeem: spent > 0 && st.step !== 0 && !refunded ? -spent : 0,
+    hasRedeem: spent > 0,
+  };
+}
+
+/** Brings one customer's ledger in line with their orders (+ referral bonuses). */
+async function reconcileCustomer(customerId, orders) {
+  if (!LOY.enabled || !customerId) return null;
+  let grantReferrer = null;
+  const out = await withLoyaltyLock(customerId, async () => {
+    const { ledger } = await loadLedger(customerId);
+    let changed = false;
+    for (const o of orders) {
+      const tg = orderPointsTarget(o);
+      changed = setEntry(ledger, 'earn:' + o.id, tg.earn, { t: 'earn', o: o.name }) || changed;
+      if (tg.hasRedeem) changed = setEntry(ledger, 'redeem:' + o.id, tg.redeem, { t: 'redeem', o: o.name }) || changed;
+    }
+    if (ledger.ref?.by) {
+      const qualified = ledger.entries.some((e) => e.k.startsWith('earn:') && e.p > 0);
+      changed = setEntry(ledger, 'welcome', qualified ? LOY.friend : 0, { t: 'welcome' }) || changed;
+      grantReferrer = { by: ledger.ref.by, qualified };
+    }
+    if (changed) await saveLedger(customerId, ledger);
+    return ledger;
+  });
+  if (grantReferrer) {
+    await withLoyaltyLock(grantReferrer.by, async () => {
+      const { ledger } = await loadLedger(grantReferrer.by);
+      const key = 'ref:' + customerId;
+      const had = ledger.entries.find((e) => e.k === key);
+      let pts = grantReferrer.qualified ? LOY.referrer : 0;
+      if (pts && !had?.p) {
+        // Monthly cap on paid referrals (anti-farming).
+        const month = new Date().toISOString().slice(0, 7);
+        const thisMonth = ledger.entries.filter((e) => e.k.startsWith('ref:') && e.p > 0 && String(e.at).startsWith(month)).length;
+        if (thisMonth >= LOY.referralMonthlyCap) pts = 0;
+      }
+      if (setEntry(ledger, key, pts, { t: 'referral' })) await saveLedger(grantReferrer.by, ledger);
+    }).catch((e) => log('referral grant failed', String(e.message || e).slice(0, 200)));
+  }
+  return out;
+}
+
+const LOYALTY_ORDERS_QUERY = `
+query LoyaltyOrders($q: String!, $after: String) {
+  orders(first: 50, after: $after, sortKey: UPDATED_AT, query: $q) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id name createdAt updatedAt cancelledAt tags displayFulfillmentStatus displayFinancialStatus
+      currentSubtotalPriceSet { shopMoney { amount } }
+      customAttributes { key value }
+      customer { id }
+      fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
+    }
+  }
+}`;
+
+let loyaltyBusy = false;
+/** Background sync: every order changed since last run updates its owner's points. */
+async function checkLoyalty() {
+  if (loyaltyBusy || !LOY.enabled) return;
+  loyaltyBusy = true;
+  try {
+    loyaltyStart();
+    const st = state.loyalty;
+    const since = new Date(Date.parse(st.since || st.startAt) - 2 * 60e3).toISOString();
+    const byCustomer = new Map();
+    let newest = st.since || st.startAt;
+    let after = null;
+    for (let page = 0; page < 10; page++) {
+      const d = await admin(LOYALTY_ORDERS_QUERY, { q: `updated_at:>'${since}'`, after });
+      for (const o of d.orders?.nodes || []) {
+        if (o.updatedAt > newest) newest = o.updatedAt;
+        const cid = o.customer?.id;
+        if (!cid) continue;
+        if (!byCustomer.has(cid)) byCustomer.set(cid, []);
+        byCustomer.get(cid).push(o);
+      }
+      if (!d.orders?.pageInfo?.hasNextPage) break;
+      after = d.orders.pageInfo.endCursor;
+    }
+    for (const [cid, orders] of byCustomer) {
+      try {
+        await reconcileCustomer(cid, orders);
+      } catch (e) {
+        log('loyalty sync', cid.split('/').pop(), String(e.message || e).slice(0, 200));
+        return; // keep `since` so this batch is retried
+      }
+    }
+    st.since = newest;
+    saveState();
+  } catch (e) {
+    log('loyalty check failed', String(e.message || e).slice(0, 300));
+  } finally {
+    loyaltyBusy = false;
+  }
+}
+if (require.main === module || process.env.LOYALTY_INTERVAL_MS) {
+  setInterval(checkLoyalty, Number(env('LOYALTY_INTERVAL_MS', '120000'))).unref();
+}
+
+function loyaltyRules() {
+  return {
+    enabled: LOY.enabled,
+    per1000: LOY.per1000,
+    minOrder: LOY.minOrder,
+    pointValue: LOY.pointValue,
+    minRedeem: LOY.minRedeem,
+    maxRedeemPct: LOY.maxRedeemPct,
+    referrer: LOY.referrer,
+    friend: LOY.friend,
+  };
+}
+
+/** "نقاطي": balance, pending points, history and the invite code. */
+async function handleLoyaltyMe(phone) {
+  if (!LOY.enabled) return { rules: loyaltyRules() };
+  let c = await customerByPhone(phone);
+  if (!c) {
+    const id = await createCustomerForPhone(phone, '', null);
+    if (!id) throw new AppError(502, 'تعذّر تجهيز حسابك، حاول مجدداً');
+    c = { id, numberOfOrders: 0 };
+  }
+  const id = c.id.split('/').pop();
+  const recent = await admin(MY_ORDERS_QUERY, { q: `customer_id:${id}` });
+  const orders = recent.orders?.nodes || [];
+  const ledger = (await reconcileCustomer(c.id, orders)) || { entries: [] };
+  const pending = orders.reduce((a, o) => a + orderPointsTarget(o).pending, 0);
+  const balance = ledgerBalance(ledger);
+  const label = { earn: 'طلب مكتمل', redeem: 'استبدال نقاط', welcome: 'هدية الانضمام بدعوة', referral: 'دعوة صديق' };
+  return {
+    rules: loyaltyRules(),
+    balance,
+    value: balance * LOY.pointValue,
+    pending,
+    code: referralCode(c.id),
+    referral: {
+      applied: Boolean(ledger.ref?.by),
+      canApply: !ledger.ref?.by && Number(c.numberOfOrders || 0) === 0,
+      friends: ledger.entries.filter((e) => e.k.startsWith('ref:') && e.p > 0).length,
+    },
+    history: ledger.entries
+      .filter((e) => e.p)
+      .sort((a, b) => String(b.upd || b.at).localeCompare(String(a.upd || a.at)))
+      .slice(0, 40)
+      .map((e) => ({ type: e.t, title: label[e.t] || 'نقاط', order: e.o || null, points: e.p, at: e.upd || e.at })),
+  };
+}
+
+/** A new customer enters a friend's code once, before their first order. */
+async function handleReferral(phone, body) {
+  if (!LOY.enabled) throw new AppError(400, 'نظام النقاط غير مفعّل');
+  const referrer = customerFromCode(body?.code);
+  if (!referrer) throw new AppError(400, 'كود الدعوة غير صحيح');
+  let c = await customerByPhone(phone);
+  if (!c) {
+    const id = await createCustomerForPhone(phone, '', null);
+    if (!id) throw new AppError(502, 'تعذّر تجهيز حسابك، حاول مجدداً');
+    c = { id, numberOfOrders: 0 };
+  }
+  if (c.id === referrer) throw new AppError(400, 'لا يمكنك استخدام كود الدعوة الخاص بك');
+  const ref = await admin(LEDGER_GET, { id: referrer });
+  if (!ref.customer) throw new AppError(400, 'كود الدعوة غير صحيح');
+  return withLoyaltyLock(c.id, async () => {
+    const { ledger, orders } = await loadLedger(c.id);
+    if (ledger.ref?.by) throw new AppError(400, 'سبق أن أضفت كود دعوة');
+    if (orders > 0) throw new AppError(400, 'كود الدعوة للزبائن الجدد قبل أول طلب فقط');
+    ledger.ref = { by: referrer, at: new Date().toISOString() };
+    await saveLedger(c.id, ledger);
+    return { ok: true, friendPoints: LOY.friend };
+  });
+}
+
+/** Cash-on-delivery order paid partly with points (atomic per customer). */
+async function placeOrderWithPoints(order) {
+  if (!LOY.enabled) throw new AppError(400, 'نظام النقاط غير مفعّل');
+  if (order.discountCode) throw new AppError(400, 'لا يمكن استخدام النقاط مع كود خصم في نفس الطلب');
+  if (order.payment !== 'cod') throw new AppError(400, 'النقاط تُستخدم مع الدفع عند الاستلام فقط');
+  let cid = await customerIdByPhone(order.customer.phone);
+  if (!cid) throw new AppError(400, 'رصيد نقاطك غير كافٍ');
+  return withLoyaltyLock(cid, async () => {
+    const { ledger } = await loadLedger(cid);
+    const balance = ledgerBalance(ledger);
+    const priced = await priceCart(order.lines);
+    const maxPts = Math.floor((priced.subtotal * LOY.maxRedeemPct) / 100 / LOY.pointValue);
+    const points = Math.min(balance, maxPts);
+    if (balance < LOY.minRedeem || points <= 0) throw new AppError(400, 'رصيد نقاطك غير كافٍ');
+    priced.discount = { code: 'JIFIRE-POINTS', title: 'نقاط الولاء', amount: points * LOY.pointValue, points, freeShipping: false };
+    const created = await createShopifyOrder(order, priced, { paid: false });
+    setEntry(ledger, 'redeem:' + created.orderId, -points, { t: 'redeem', o: created.orderName });
+    try {
+      await saveLedger(created.customerId || cid, ledger);
+    } catch (e) {
+      // The order carries jifire_points_redeemed: the next sync records it.
+      log('ledger save after order failed', String(e.message || e).slice(0, 200));
+    }
+    return {
+      status: 'created',
+      orderName: created.orderName,
+      total: created.total,
+      discount: created.discount,
+      pointsUsed: points,
+      deliveryFee: created.deliveryFee,
+      currency: created.currency,
+      message: order.delivery === 'pickup' ? CFG.texts.successPickup : CFG.texts.success,
+    };
+  });
+}
+
 // ---------------------------------------------------------- my orders ---
 // "طلباتي" / order tracking in the app: the logged-in phone's Shopify orders
 // with a 4-step status (received → preparing → on the way → delivered).
@@ -1285,8 +1638,11 @@ const MY_ORDERS_QUERY = `
 query MyOrders($q: String!) {
   orders(first: 20, query: $q, sortKey: CREATED_AT, reverse: true) {
     nodes {
-      id name createdAt cancelledAt tags displayFulfillmentStatus
+      id name createdAt cancelledAt tags displayFulfillmentStatus displayFinancialStatus
       totalPriceSet { shopMoney { amount } }
+      currentSubtotalPriceSet { shopMoney { amount } }
+      customAttributes { key value }
+      customer { id }
       shippingAddress { city address1 }
       lineItems(first: 6) { nodes { title quantity image { url } } }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
@@ -1386,7 +1742,13 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   }
   const consent = state.consent?.[order.customer.phone];
   if (consent) attrs.push({ key: 'موافقة عروض واتساب', value: consent.wa ? 'نعم' : 'لا' });
-  if (disc) {
+  if (disc?.points) {
+    attrs.push(
+      { key: 'jifire_points_redeemed', value: String(disc.points) },
+      { key: 'نقاط الولاء المستبدلة', value: `${disc.points} نقطة (-${discount})` }
+    );
+    tags.push('استبدال نقاط ولاء');
+  } else if (disc) {
     attrs.push({ key: 'كود الخصم', value: disc.code + (discount ? ` (-${discount})` : ' (توصيل مجاني)') });
     tags.push('كود خصم: ' + disc.code);
   }
@@ -1543,12 +1905,20 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   }
   const o = data.orderCreate.order;
   if (consent) syncConsent(order.customer.phone, existingId || o.customer?.id || null);
-  if (disc) {
+  if (disc && !disc.points) {
     state.discountUses = state.discountUses || {};
     state.discountUses[`${disc.code.toLowerCase()}|${order.customer.phone}`] = Date.now();
     saveState();
   }
-  return { orderId: o.id, orderName: o.name, total, discount, deliveryFee: fee, currency: priced.currency };
+  return {
+    orderId: o.id,
+    orderName: o.name,
+    customerId: existingId || o.customer?.id || null,
+    total,
+    discount,
+    deliveryFee: fee,
+    currency: priced.currency,
+  };
 }
 
 function aqsatiUrl(order, created) {
@@ -2190,6 +2560,7 @@ function validateOrder(body, opts = {}) {
     payment,
     note: str(o.note, 500),
     discountCode: cleanCode(o.discountCode),
+    usePoints: o.usePoints === true,
     marketing: o.marketing === true,
     idempotencyKey,
   };
@@ -2220,6 +2591,7 @@ async function handleConfig() {
     governorates: WASEET.map((c) => c.name),
     waseet: true,
     discounts: true,
+    loyalty: loyaltyRules(),
     assistant: { ai: Boolean(CFG.ai.key) },
     texts: {
       receivedTitle: CFG.texts.receivedTitle,
@@ -2265,6 +2637,13 @@ async function handleOrder(body, ip, sessionPhone) {
 
   rateLimit(ip, 'order', CFG.ordersPerIp, 10 * 60e3);
   rateLimit(order.customer.phone, 'order-phone', 4, 10 * 60e3);
+
+  if (order.usePoints) {
+    const result = await placeOrderWithPoints(order);
+    state.idempotency[order.idempotencyKey] = { at: Date.now(), result };
+    saveState();
+    return result;
+  }
 
   const priced = await priceOrder(order);
   const { fee, discount, total } = orderTotals(order, priced);
@@ -2421,6 +2800,15 @@ const EDITABLE = [
   ['MSG_RECEIVED_BODY', 'إشعار استلام الطلب: النص', false],
   ['MSG_SHIPPED_TITLE', 'إشعار خروج الطلب للتوصيل: العنوان ({order} = رقم الطلب)', false],
   ['MSG_SHIPPED_BODY', 'إشعار خروج الطلب للتوصيل: النص ({order} = رقم الطلب)', false],
+  ['LOYALTY_ENABLED', 'نظام النقاط: مفعّل؟ (true / false)', false],
+  ['LOYALTY_POINTS_PER_1000', 'النقاط: كم نقطة لكل 1000 د.ع من قيمة المنتجات', false],
+  ['LOYALTY_MIN_ORDER', 'النقاط: أقل قيمة طلب تكسب نقاط (د.ع)', false],
+  ['LOYALTY_POINT_VALUE', 'النقاط: قيمة النقطة الواحدة عند الاستبدال (د.ع)', false],
+  ['LOYALTY_MIN_REDEEM', 'النقاط: أقل رصيد يسمح بالاستبدال', false],
+  ['LOYALTY_MAX_REDEEM_PCT', 'النقاط: أقصى نسبة من قيمة المنتجات تُدفع بالنقاط (%)', false],
+  ['LOYALTY_REFERRER_POINTS', 'النقاط: مكافأة صاحب الدعوة', false],
+  ['LOYALTY_FRIEND_POINTS', 'النقاط: هدية الصديق المدعو', false],
+  ['LOYALTY_REFERRAL_MONTHLY_CAP', 'النقاط: أقصى عدد دعوات مكافأة بالشهر للشخص', false],
   ['MSG_DELIVERED_TITLE', 'إشعار تسليم الطلب: العنوان ({order} = رقم الطلب)', false],
   ['MSG_DELIVERED_BODY', 'إشعار تسليم الطلب: النص ({order} = رقم الطلب)', false],
   ['MSG_CANCELLED_TITLE', 'إشعار إلغاء الطلب: العنوان ({order} = رقم الطلب)', false],
@@ -2694,6 +3082,28 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await handleNotices());
     }
 
+    if (req.method === 'GET' && p === '/api/loyalty/me') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'loyalty', 30, 10 * 60e3);
+      return send(res, 200, await handleLoyaltyMe(phone));
+    }
+
+    if (req.method === 'POST' && p === '/api/loyalty/referral') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'referral', 5, 60 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, await handleReferral(phone, body));
+    }
+
     if (req.method === 'GET' && p === '/api/support') {
       checkAppKey(req);
       return send(res, 200, await handleSupport());
@@ -2827,4 +3237,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks };
+module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
