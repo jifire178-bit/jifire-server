@@ -71,6 +71,15 @@ const CFG = {
     hours: env('PICKUP_HOURS', ''),
   },
   cod: bool('COD_ENABLED', true),
+  // Customer-facing texts, editable from /admin (Arabic). {order} = order number.
+  texts: {
+    success: env('MSG_SUCCESS', 'سنتصل بك لتأكيد الطلب ثم نرسله إليك.'),
+    successPickup: env('MSG_SUCCESS_PICKUP', 'طلبك جاهز للاستلام بعد تأكيده، سنتصل بك.'),
+    receivedTitle: env('MSG_RECEIVED_TITLE', 'تم استلام طلبك ✅'),
+    receivedBody: env('MSG_RECEIVED_BODY', 'شكراً لتسوقك من جي فاير! سنتواصل معك قريباً لتأكيد التوصيل.'),
+    shippedTitle: env('MSG_SHIPPED_TITLE', 'طلبك في طريقه إليك 🚚'),
+    shippedBody: env('MSG_SHIPPED_BODY', 'طلبك {order} خرج للتوصيل وسيصلك قريباً. شكراً لتسوقك من جي فاير!'),
+  },
   aqsati: {
     enabled: bool('AQSATI_ENABLED', true),
     apiBase: env('AQSATI_API_BASE_URL').replace(/\/+$/, ''),
@@ -1075,7 +1084,7 @@ async function fcmAccessToken(sa) {
 }
 
 /** Returns 'ok', 'invalid' (token gone: forget it) or 'error'. */
-async function sendPush(token, { title, body, data = {} }) {
+async function sendPush(token, { title, body, data = {}, dataOnly = false }) {
   const sa = serviceAccount();
   if (!sa) return 'error';
   const base = env('FCM_API_BASE', 'https://fcm.googleapis.com');
@@ -1085,11 +1094,15 @@ async function sendPush(token, { title, body, data = {} }) {
     body: JSON.stringify({
       message: {
         token,
-        notification: { title, body },
-        data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+        ...(dataOnly ? {} : { notification: { title, body } }),
+        data: Object.fromEntries(
+          Object.entries(dataOnly ? { ...data, title, body } : data).map(([k, v]) => [k, String(v)])
+        ),
         android: {
           priority: 'high',
-          notification: { channel_id: 'jifire_store', color: '#E2B85A', icon: 'ic_stat_notify' },
+          ...(dataOnly
+            ? {}
+            : { notification: { channel_id: 'jifire_store', color: '#E2B85A', icon: 'ic_stat_notify' } }),
         },
       },
     }),
@@ -1124,7 +1137,7 @@ function unregisterPushToken(token) {
 }
 
 const SHIPPED_TEXT = {
-  ar: (n) => ({ title: 'طلبك في طريقه إليك 🚚', body: `طلبك ${n} خرج للتوصيل وسيصلك قريباً. شكراً لتسوقك من جي فاير!` }),
+  ar: (n) => ({ title: CFG.texts.shippedTitle.replace('{order}', n), body: CFG.texts.shippedBody.replace('{order}', n) }),
   en: (n) => ({ title: 'Your order is on its way 🚚', body: `Order ${n} is out for delivery and will reach you soon. Thanks for shopping at JiFire!` }),
   ckb: (n) => ({ title: 'داواکارییەکەت لە ڕێگادایە 🚚', body: `داواکاری ${n} نێردرا بۆ گەیاندن و بەم زووانە دەگات. سوپاس بۆ کڕین لە جی فایەر!` }),
 };
@@ -1170,7 +1183,12 @@ async function checkFulfilledOrders() {
       for (const ph of phones) {
         for (const dev of [...(state.push[ph] || [])]) {
           const msg = (SHIPPED_TEXT[dev.lang] || SHIPPED_TEXT.ar)(o.name);
-          const r = await sendPush(dev.token, { ...msg, data: { type: 'order', status: 'shipped', order: o.name } });
+          // Data-only: the app shows its live order tracker (step 3 of 4).
+          const r = await sendPush(dev.token, {
+            ...msg,
+            dataOnly: true,
+            data: { type: 'order', status: 'shipped', step: 3, order: o.name },
+          });
           if (r === 'invalid') unregisterPushToken(dev.token);
           log('order push', o.name, ph.slice(-4), r);
         }
@@ -2078,6 +2096,12 @@ async function handleConfig() {
     waseet: true,
     discounts: true,
     assistant: { ai: Boolean(CFG.ai.key) },
+    texts: {
+      receivedTitle: CFG.texts.receivedTitle,
+      receivedBody: CFG.texts.receivedBody,
+      shippedTitle: CFG.texts.shippedTitle,
+      shippedBody: CFG.texts.shippedBody,
+    },
     delivery: {
       defaultFee: CFG.defaultDeliveryFee,
       fees: CFG.deliveryFees,
@@ -2156,8 +2180,8 @@ async function handleOrder(body, ip, sessionPhone) {
             ? 'تم تسجيل طلبك. أكمل خطوات التقسيط في صفحة أقساطي.'
             : CFG.aqsati.note
           : order.delivery === 'pickup'
-            ? 'طلبك جاهز للاستلام بعد تأكيده، سنتصل بك.'
-            : 'سنتصل بك لتأكيد الطلب ثم نرسله إليك.',
+            ? CFG.texts.successPickup
+            : CFG.texts.success,
     };
   }
   state.idempotency[order.idempotencyKey] = { at: Date.now(), result };
@@ -2262,6 +2286,12 @@ const EDITABLE = [
   ['MSG91_WA_LANG', 'لغة القالب (ar أو en)', false],
   ['OTP_TEST_PHONE', 'رقم تجربة (اختياري)', false],
   ['OTP_TEST_CODE', 'رمز تجربة (اختياري)', true],
+  ['MSG_SUCCESS', 'رسالة صفحة نجاح الطلب (توصيل)', false],
+  ['MSG_SUCCESS_PICKUP', 'رسالة صفحة نجاح الطلب (استلام من المتجر)', false],
+  ['MSG_RECEIVED_TITLE', 'إشعار استلام الطلب: العنوان', false],
+  ['MSG_RECEIVED_BODY', 'إشعار استلام الطلب: النص', false],
+  ['MSG_SHIPPED_TITLE', 'إشعار خروج الطلب للتوصيل: العنوان ({order} = رقم الطلب)', false],
+  ['MSG_SHIPPED_BODY', 'إشعار خروج الطلب للتوصيل: النص ({order} = رقم الطلب)', false],
   ['AI_API_KEY', 'مفتاح الذكاء الاصطناعي (Gemini API key)', true],
   ['FIREBASE_SERVICE_ACCOUNT', 'مفتاح خدمة Firebase (ملف JSON) لإشعارات حالة الطلب', true],
   ['AI_MODEL', 'نموذج الذكاء الاصطناعي (اتركه فارغاً للافتراضي)', false],
