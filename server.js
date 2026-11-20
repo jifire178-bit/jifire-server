@@ -694,7 +694,18 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
         }
       : {}),
   };
+  // Same phone = same customer: attach the order to the existing Shopify
+  // customer instead of creating a duplicate (e.g. matched by email only).
+  let existingId = null;
   if (CFG.upsertCustomer) {
+    existingId = await customerIdByPhone(order.customer.phone).catch((e) => {
+      log('customer lookup failed', String(e.message || e).slice(0, 200));
+      return null;
+    });
+  }
+  if (existingId) {
+    input.customer = { toAssociate: { id: existingId } };
+  } else if (CFG.upsertCustomer) {
     input.customer = {
       toUpsert: {
         firstName,
@@ -776,7 +787,7 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       (lastErr?.message || 'خطأ من إدارة المتجر') + (detail ? ` (${detail})` : ''));
   }
   const o = data.orderCreate.order;
-  if (consent) syncConsent(order.customer.phone, o.customer?.id || null);
+  if (consent) syncConsent(order.customer.phone, existingId || o.customer?.id || null);
   if (disc) {
     state.discountUses = state.discountUses || {};
     state.discountUses[`${disc.code.toLowerCase()}|${order.customer.phone}`] = Date.now();
@@ -940,7 +951,16 @@ async function sendWhatsappOtp(phone) {
 
 // ---- WhatsApp marketing consent -> Shopify customer
 const CUSTOMER_BY_PHONE = `
-query CustomerByPhone($q: String!) { customers(first: 1, query: $q) { nodes { id tags } } }`;
+query CustomerByPhone($q: String!) {
+  customers(first: 20, query: $q) { nodes { id defaultPhoneNumber { phoneNumber } } }
+}`;
+
+/** Shopify's phone search is fuzzy: only accept an exact number match. */
+async function customerIdByPhone(phone) {
+  const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
+  const hit = (found.customers?.nodes || []).find((n) => n.defaultPhoneNumber?.phoneNumber === phone);
+  return hit?.id || null;
+}
 const CUSTOMER_CREATE = `
 mutation CustomerCreate($input: CustomerInput!) {
   customerCreate(input: $input) { customer { id } userErrors { field message } }
@@ -970,10 +990,7 @@ async function syncConsent(phone, customerId = null) {
   if (!c || (c.synced && (!customerId || c.synced === customerId))) return;
   try {
     let id = customerId;
-    if (!id) {
-      const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
-      id = found.customers?.nodes?.[0]?.id || null;
-    }
+    if (!id) id = await customerIdByPhone(phone);
     if (!id && c.wa) {
       const made = await admin(CUSTOMER_CREATE, { input: { phone, tags: ['تطبيق جي فاير', WA_TAG] } });
       id = made.customerCreate?.customer?.id || null;
