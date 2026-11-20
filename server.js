@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.7.3';
+const APP_RELEASE = '3.7.4';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -1251,6 +1251,7 @@ query Fulfilled($q: String!) {
       customer { defaultPhoneNumber { phoneNumber } }
       shippingAddress { phone }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
+      lineItems(first: 5) { nodes { product { handle title } } }
     }
   }
 }`;
@@ -1285,6 +1286,19 @@ async function checkFulfilledOrders() {
           .map(normalizePhone)
           .filter(Boolean)
       );
+      if (st.status === 'delivered') {
+        // A day later: "كيف كان منتجك؟ قيّمه" opening the received product.
+        const item = (o.lineItems?.nodes || []).find((li) => li.product?.handle);
+        if (item) {
+          state.reviewAsks = state.reviewAsks || {};
+          state.reviewAsks[o.id] = {
+            due: Date.now() + Number(env('REVIEW_ASK_HOURS', '24')) * 3600e3,
+            phones: [...phones],
+            handle: item.product.handle,
+            title: item.product.title,
+          };
+        }
+      }
       for (const ph of phones) {
         for (const dev of [...(state.push[ph] || [])]) {
           const texts = ORDER_TEXT[st.status];
@@ -1756,6 +1770,31 @@ async function checkWatches() {
 }
 if (require.main === module || process.env.WATCH_INTERVAL_MS) {
   setInterval(checkWatches, Number(env('WATCH_INTERVAL_MS', String(10 * 60e3)))).unref();
+}
+
+/** Sends the due "rate your product" pushes (once per delivered order). */
+async function checkReviewAsks() {
+  const asks = state.reviewAsks || {};
+  const due = Object.entries(asks).filter(([, a]) => a.due <= Date.now());
+  if (!due.length || !pushEnabled()) return;
+  for (const [id, a] of due) {
+    delete asks[id];
+    for (const ph of a.phones) {
+      for (const dev of [...(state.push?.[ph] || [])]) {
+        const r = await sendPush(dev.token, {
+          title: 'كيف كان منتجك؟ ⭐',
+          body: `قيّم ${a.title} بثوانٍ وساعد غيرك يختار`,
+          data: { type: 'product', product: a.handle, review: '1' },
+        }).catch(() => 'error');
+        if (r === 'invalid') unregisterPushToken(dev.token);
+        log('review ask', a.handle, ph.slice(-4), r);
+      }
+    }
+  }
+  saveState();
+}
+if (require.main === module || process.env.WATCH_INTERVAL_MS) {
+  setInterval(() => checkReviewAsks().catch(() => {}), Number(env('WATCH_INTERVAL_MS', String(10 * 60e3)))).unref();
 }
 
 // Share links: https://<server>/p/<handle> opens the app when installed
@@ -2963,6 +3002,7 @@ const EDITABLE = [
   ['LOYALTY_REFERRER_POINTS', 'النقاط: مكافأة صاحب الدعوة', false],
   ['LOYALTY_FRIEND_POINTS', 'النقاط: هدية الصديق المدعو', false],
   ['LOYALTY_REFERRAL_MONTHLY_CAP', 'النقاط: أقصى عدد دعوات مكافأة بالشهر للشخص', false],
+  ['REVIEW_ASK_HOURS', 'إشعار «قيّم منتجك»: بعد كم ساعة من التسليم', false],
   ['MSG_DELIVERED_TITLE', 'إشعار تسليم الطلب: العنوان ({order} = رقم الطلب)', false],
   ['MSG_DELIVERED_BODY', 'إشعار تسليم الطلب: النص ({order} = رقم الطلب)', false],
   ['MSG_CANCELLED_TITLE', 'إشعار إلغاء الطلب: العنوان ({order} = رقم الطلب)', false],
@@ -3240,7 +3280,7 @@ const ADMIN_GROUPS = [
   { id: 'app', title: 'التطبيق والتحديثات', icon: '📲', test: (k) => k.startsWith('APP_'),
     note: 'ثبّت النسخة الجديدة على جوالك وضعها على رابط التحديث أولاً، ثم ارفع ملف الخادم.' },
   { id: 'loyalty', title: 'النقاط والدعوة', icon: '⭐', test: (k) => k.startsWith('LOYALTY_') },
-  { id: 'messages', title: 'الرسائل والإشعارات', icon: '🔔', test: (k) => k.startsWith('MSG_'),
+  { id: 'messages', title: 'الرسائل والإشعارات', icon: '🔔', test: (k) => k.startsWith('MSG_') || k === 'REVIEW_ASK_HOURS',
     note: 'اكتب {order} مكان رقم الطلب.' },
   { id: 'delivery', title: 'التوصيل والاستلام', icon: '🚚', test: (k) => /^(DELIVERY_|FREE_DELIVERY|PICKUP_|COD_)/.test(k) },
   { id: 'otp', title: 'رمز الدخول (MSG91)', icon: '🔐', test: (k) => /^(MSG91_|OTP_)/.test(k),
@@ -3308,6 +3348,7 @@ function adminDefaults() {
     MSG_CANCELLED_TITLE: t.cancelledTitle,
     MSG_CANCELLED_BODY: t.cancelledBody,
     LOYALTY_ENABLED: String(LOY.enabled),
+    REVIEW_ASK_HOURS: env('REVIEW_ASK_HOURS', '24'),
     APP_FORCE_LATEST: String(CFG.app.forceLatest),
     PICKUP_ENABLED: String(bool('PICKUP_ENABLED', true)),
     COD_ENABLED: String(bool('COD_ENABLED', true)),
