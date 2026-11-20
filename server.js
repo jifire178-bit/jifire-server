@@ -65,11 +65,23 @@ const CFG = {
   cod: bool('COD_ENABLED', true),
   aqsati: {
     enabled: bool('AQSATI_ENABLED', true),
+    apiBase: env('AQSATI_API_BASE_URL').replace(/\/+$/, ''),
+    merchantKey: env('AQSATI_MERCHANT_KEY'),
+    // months:markup%  — same plans as the existing Aqsati page
+    plans: env('AQSATI_PLANS', '10:25,18:40')
+      .split(',')
+      .map((x) => x.split(':').map(Number))
+      .filter(([m, r]) => m > 0 && r >= 0),
     // Existing Aqsati site: after the Shopify order is created the customer is
     // sent there. Placeholders: {order_id} {order_number} {order_name} {total}
     // {phone} {name} {email}
     redirectUrl: env('AQSATI_REDIRECT_URL'),
-    gateway: env('AQSATI_GATEWAY_NAME', 'Aqsati'),
+    // NOT "أقساطي": the existing Aqsati system auto-cancels orders with that
+    // gateway name 30 min after creation.
+    gateway: (() => {
+      const g = env('AQSATI_GATEWAY_NAME', 'Aqsati App');
+      return g.trim() === 'أقساطي' ? 'Aqsati App' : g;
+    })(),
     note: env(
       'AQSATI_NOTE',
       'سيتواصل معك فريق جي فاير لإكمال إجراءات التقسيط عبر كي كارد قبل التوصيل.'
@@ -273,7 +285,7 @@ const PAYMENT_LABEL = {
   aqsati: 'أقساطي (كي كارد)',
 };
 
-async function createShopifyOrder(order, priced, { paid, gatewayRef, review }) {
+async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqsati }) {
   const fee = deliveryFee(order, priced.subtotal);
   const total = priced.subtotal + fee;
   const money = (amount) => ({
@@ -309,7 +321,17 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review }) {
     { key: 'طريقة الدفع', value: PAYMENT_LABEL[order.payment] },
     { key: 'طريقة الاستلام', value: pickup ? 'استلام من المتجر' : 'توصيل' },
   ];
-  if (gatewayRef) attrs.push({ key: 'مرجع HyperPay', value: gatewayRef });
+  if (gatewayRef && order.payment === 'card') attrs.push({ key: 'مرجع HyperPay', value: gatewayRef });
+  if (aqsati) {
+    attrs.push(
+      { key: 'رقم معاملة أقساطي', value: String(aqsati.installmentId ?? '') },
+      { key: 'عدد الأشهر', value: String(aqsati.plan.months) },
+      { key: 'المبلغ بعد الفائدة', value: String(aqsati.plan.finalAmount) },
+      { key: 'القسط الشهري', value: String(aqsati.plan.perMonth) },
+      { key: 'رقم حساب أقساطي', value: String(aqsati.identity) }
+    );
+    tags.push('osp: تم الدفع عن طريق اقساطي بنجاح');
+  }
 
   const input = {
     currency: priced.currency,
@@ -597,6 +619,148 @@ async function handleOtpVerify(body, ip) {
   return { token: signSession(phone), phone, expiresInDays: CFG.otp.sessionDays };
 }
 
+// --------------------------------------------------------------- aqsati ---
+// Direct Aqsati (Qi Card) financing. Same API and plans as the existing
+// Aqsati page, but the Shopify order is created only after the installment
+// is approved.
+
+const aqsatiEnabled = () =>
+  CFG.aqsati.enabled && Boolean(CFG.aqsati.apiBase && CFG.aqsati.merchantKey);
+
+async function aqsatiPost(pathName, body) {
+  let res;
+  try {
+    res = await fetch(`${CFG.aqsati.apiBase}${pathName}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: CFG.aqsati.merchantKey },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    log('aqsati network', pathName, e.message);
+    throw new AppError(502, 'تعذّر الاتصال بأقساطي، حاول بعد قليل');
+  }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    log('aqsati http', pathName, res.status, JSON.stringify(json).slice(0, 300));
+    throw new AppError(502, json?.message || `خطأ من أقساطي (${res.status})`);
+  }
+  if (!json.succeeded) {
+    log('aqsati refused', pathName, JSON.stringify(json).slice(0, 300));
+    throw new AppError(400, json?.message || 'رفضت أقساطي الطلب');
+  }
+  return json.data || {};
+}
+
+function aqsatiPending(ref, phone) {
+  const p = state.pending[ref];
+  if (!p || p.kind !== 'aqsati' || Date.now() - p.at > 30 * 60e3) {
+    throw new AppError(410, 'انتهت مهلة عملية التقسيط، ابدأ من جديد');
+  }
+  if (otpEnabled() && p.order.customer.phone !== phone) throw new AppError(403, 'غير مصرّح');
+  return p;
+}
+
+const planOptions = (amount, min, max) =>
+  CFG.aqsati.plans
+    .filter(([m]) => (!min || m >= min) && (!max || m <= max))
+    .map(([months, rate]) => {
+      const finalAmount = Math.round(amount * (1 + rate / 100));
+      return { months, rate, finalAmount, perMonth: Math.round(finalAmount / months) };
+    });
+
+/** Step 1: validate cart + customer, price it, keep it pending. No order yet. */
+async function aqsatiStart(body, ip, sessionPhone) {
+  if (!aqsatiEnabled()) throw new AppError(400, 'أقساطي غير متاح حالياً');
+  if (otpEnabled() && !sessionPhone) throw new AppError(401, 'سجّل الدخول برقم هاتفك أولاً');
+  const order = validateOrder({ ...body, payment: 'aqsati' }, { allowAqsati: true });
+  if (sessionPhone) order.customer.phone = sessionPhone;
+  rateLimit(ip, 'aqsati-start', 10, 10 * 60e3);
+  const priced = await priceCart(order.lines);
+  const fee = deliveryFee(order, priced.subtotal);
+  const amount = priced.subtotal + fee;
+  const ref = 'AQ' + crypto.randomBytes(12).toString('base64url');
+  state.pending[ref] = { kind: 'aqsati', at: Date.now(), order, priced, amount, stage: 'identity', tries: 0 };
+  saveState();
+  return { ref, amount, deliveryFee: fee, currency: priced.currency, plans: planOptions(amount) };
+}
+
+/** Step 2: Qi account number -> Aqsati session + allowed months. */
+async function aqsatiIdentity(body, sessionPhone) {
+  const p = aqsatiPending(String(body?.ref || ''), sessionPhone);
+  const identity = String(body?.identity || '').replace(/[٠-٩]/g, (c) => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9-]{4,40}$/.test(identity)) throw new AppError(400, 'أدخل رقم الحساب بشكل صحيح');
+  if (++p.tries > 6) throw new AppError(429, 'محاولات كثيرة، ابدأ من جديد');
+  const data = await aqsatiPost('/GetCustomerInformation', { Identity: identity });
+  const info = data?.merchantInformation?.productInformation || {};
+  const sessionId = data?.session?.sessionId;
+  if (!sessionId) throw new AppError(502, 'ردّ غير متوقع من أقساطي');
+  const plans = planOptions(p.amount, info.minCountOfMonth, info.maxCountOfMonth);
+  if (!plans.length) throw new AppError(400, 'لا توجد خطة تقسيط مناسبة لحسابك');
+  Object.assign(p, {
+    stage: 'plan',
+    identity,
+    sessionId,
+    repaymentLimit: info.repaymentLimit,
+  });
+  saveState();
+  return { plans, repaymentLimit: info.repaymentLimit ?? null };
+}
+
+/** Step 3: choose months -> Aqsati sends a code to the customer's device. */
+async function aqsatiPlan(body, sessionPhone) {
+  const p = aqsatiPending(String(body?.ref || ''), sessionPhone);
+  if (!p.sessionId) throw new AppError(400, 'أدخل رقم الحساب أولاً');
+  const months = Number(body?.months);
+  const plan = planOptions(p.amount).find((x) => x.months === months);
+  if (!plan) throw new AppError(400, 'اختر عدد الأشهر');
+  await aqsatiPost('/ValidatorOfInstallment', {
+    sessionId: p.sessionId,
+    amount: plan.finalAmount,
+    countOfMonth: plan.months,
+  });
+  Object.assign(p, { stage: 'otp', plan, otpTries: 0 });
+  saveState();
+  return { ok: true, plan, message: 'أرسلت أقساطي رمز تحقق إلى جهازك المسجّل لديها' };
+}
+
+/** Step 4: code -> installment created -> Shopify order created as paid. */
+async function aqsatiConfirm(body, sessionPhone) {
+  const ref = String(body?.ref || '');
+  const p = aqsatiPending(ref, sessionPhone);
+  if (p.stage === 'done') return { status: 'created', orderName: p.orderName, plan: p.plan };
+  if (p.stage !== 'otp' || !p.plan) throw new AppError(400, 'اختر خطة التقسيط أولاً');
+  const otp = String(body?.otp || '').replace(/[٠-٩]/g, (c) => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/\D/g, '');
+  if (otp.length < 4 || otp.length > 8) throw new AppError(400, 'أدخل رمز التحقق');
+  if (++p.otpTries > 5) throw new AppError(429, 'محاولات كثيرة، ابدأ من جديد');
+  if (p.stage === 'creating') throw new AppError(409, 'جاري تسجيل الطلب، انتظر لحظة');
+
+  const note = p.order.customer.name;
+  const inst = await aqsatiPost('/CreateInstallment', { sessionId: p.sessionId, OTP: Number(otp), Note: note });
+  p.stage = 'creating';
+  p.installmentId = inst?.installmentId;
+  saveState();
+  try {
+    const created = await createShopifyOrder(p.order, p.priced, {
+      paid: true,
+      gatewayRef: String(inst?.installmentId ?? inst?.operationId ?? ''),
+      aqsati: { plan: p.plan, installmentId: inst?.installmentId, identity: p.identity },
+    });
+    Object.assign(p, { stage: 'done', orderName: created.orderName });
+    state.idempotency[p.order.idempotencyKey] = {
+      at: Date.now(),
+      result: { status: 'created', orderName: created.orderName, total: created.total, currency: created.currency },
+    };
+    saveState();
+    return { status: 'created', orderName: created.orderName, plan: p.plan };
+  } catch (e) {
+    p.stage = 'paid_not_created';
+    saveState();
+    log('AQSATI APPROVED BUT ORDER NOT CREATED', ref, inst?.installmentId, e.message);
+    throw new AppError(502, `تمت الموافقة على التقسيط لكن تعذّر تسجيل الطلب تلقائياً. احتفظ بالرمز ${ref.slice(0, 10)} وتواصل مع المتجر.`);
+  }
+}
+
 // ---------------------------------------------------------- validation ---
 
 class AppError extends Error {
@@ -620,7 +784,7 @@ function normalizePhone(p) {
 
 const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 
-function validateOrder(body) {
+function validateOrder(body, opts = {}) {
   const o = body || {};
   const lines = Array.isArray(o.lines) ? o.lines : [];
   if (!lines.length || lines.length > 30) throw new AppError(400, 'السلة فارغة');
@@ -659,7 +823,9 @@ function validateOrder(body) {
   if (!payment) throw new AppError(400, 'اختر طريقة الدفع');
   if (payment === 'cod' && !CFG.cod) throw new AppError(400, 'الدفع عند الاستلام غير متاح');
   if (payment === 'card' && !hyperpayEnabled()) throw new AppError(400, 'الدفع بالبطاقة غير متاح حالياً');
-  if (payment === 'aqsati' && !CFG.aqsati.enabled) throw new AppError(400, 'أقساطي غير متاح حالياً');
+  if (payment === 'aqsati' && (!aqsatiEnabled() || !opts.allowAqsati)) {
+    throw new AppError(400, 'أقساطي غير متاح حالياً');
+  }
 
   const idempotencyKey = str(o.idempotencyKey, 64);
   if (!/^[A-Za-z0-9-]{16,64}$/.test(idempotencyKey)) throw new AppError(400, 'طلب غير صالح');
@@ -710,8 +876,13 @@ async function handleConfig() {
       ...(hyperpayEnabled()
         ? [{ id: 'card', title: 'الدفع الإلكتروني بالبطاقة', subtitle: CFG.hyperpay.brands.replace(/\s+/g, ' · ') }]
         : []),
-      ...(CFG.aqsati.enabled
-        ? [{ id: 'aqsati', title: 'أقساطي – كي كارد', subtitle: 'قسّط مشترياتك عبر بطاقة كي', note: CFG.aqsati.note }]
+      ...(aqsatiEnabled()
+        ? [{
+            id: 'aqsati',
+            title: 'أقساطي – كي كارد',
+            subtitle: CFG.aqsati.plans.map(([m]) => `${m} شهراً`).join(' أو '),
+            flow: 'aqsati',
+          }]
         : []),
     ],
   };
@@ -887,6 +1058,9 @@ const EDITABLE = [
   ['PICKUP_HOURS', 'أوقات الدوام', false],
   ['COD_ENABLED', 'الدفع عند الاستلام (true/false)', false],
   ['AQSATI_ENABLED', 'أقساطي (true/false)', false],
+  ['AQSATI_API_BASE_URL', 'رابط API أقساطي (تجريبي أو حقيقي)', false],
+  ['AQSATI_MERCHANT_KEY', 'مفتاح التاجر لأقساطي', true],
+  ['AQSATI_PLANS', 'خطط التقسيط أشهر:نسبة (10:25,18:40)', false],
 ];
 
 function adminPassOk(given) {
@@ -916,6 +1090,7 @@ button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;fo
 <body><div class="w"><h1>إعدادات خادم جي فاير</h1>
 <div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 تسجيل الدخول برمز SMS: <b>${otpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(CFG.aqsati.apiBase ? new URL(CFG.aqsati.apiBase).host : '')}</span><br>
 عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
 ${msg ? `<div class="m">${escapeHtml(msg)}</div>` : ''}
 <form method="post" action="/admin">
@@ -1016,6 +1191,24 @@ const server = http.createServer(async (req, res) => {
       }
       const fn = p.endsWith('/send') ? handleOtpSend : handleOtpVerify;
       return send(res, 200, await fn(body, clientIp(req)));
+    }
+
+    if (req.method === 'POST' && p.startsWith('/api/aqsati/')) {
+      checkAppKey(req);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      const phone = readSession(req);
+      const step = p.slice('/api/aqsati/'.length);
+      const fn = { start: () => aqsatiStart(body, clientIp(req), phone),
+        identity: () => aqsatiIdentity(body, phone),
+        plan: () => aqsatiPlan(body, phone),
+        confirm: () => aqsatiConfirm(body, phone) }[step];
+      if (!fn) throw new AppError(404, 'غير موجود');
+      return send(res, 200, await fn());
     }
 
     if (req.method === 'GET' && p === '/api/auth/me') {
