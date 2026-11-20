@@ -79,6 +79,10 @@ const CFG = {
     receivedBody: env('MSG_RECEIVED_BODY', 'سنوافيك بتحديثات طلبك قريباً. شكراً لتسوقك من جي فاير!'),
     shippedTitle: env('MSG_SHIPPED_TITLE', 'طلبك في طريقه إليك 🚚'),
     shippedBody: env('MSG_SHIPPED_BODY', 'طلبك {order} خرج للتوصيل وسيصلك قريباً. شكراً لتسوقك من جي فاير!'),
+    deliveredTitle: env('MSG_DELIVERED_TITLE', 'تم تسليم طلبك 🎉'),
+    deliveredBody: env('MSG_DELIVERED_BODY', 'تم تسليم طلبك {order} بنجاح. شكراً لتسوقك من جي فاير!'),
+    cancelledTitle: env('MSG_CANCELLED_TITLE', 'تم إلغاء طلبك'),
+    cancelledBody: env('MSG_CANCELLED_BODY', 'تم إلغاء طلبك {order}. للاستفسار تواصل معنا عبر فيسبوك أو انستغرام.'),
   },
   aqsati: {
     enabled: bool('AQSATI_ENABLED', true),
@@ -1181,19 +1185,35 @@ function unregisterPushToken(token) {
   saveState();
 }
 
-const SHIPPED_TEXT = {
-  ar: (n) => ({ title: CFG.texts.shippedTitle.replace('{order}', n), body: CFG.texts.shippedBody.replace('{order}', n) }),
-  en: (n) => ({ title: 'Your order is on its way 🚚', body: `Order ${n} is out for delivery and will reach you soon. Thanks for shopping at JiFire!` }),
-  ckb: (n) => ({ title: 'داواکارییەکەت لە ڕێگادایە 🚚', body: `داواکاری ${n} نێردرا بۆ گەیاندن و بەم زووانە دەگات. سوپاس بۆ کڕین لە جی فایەر!` }),
+const fill = (t, n) => String(t || '').replace(/\{order\}/g, n);
+const ORDER_TEXT = {
+  shipped: {
+    ar: (n) => ({ title: fill(CFG.texts.shippedTitle, n), body: fill(CFG.texts.shippedBody, n) }),
+    en: (n) => ({ title: 'Your order is on its way 🚚', body: `Order ${n} is out for delivery and will reach you soon. Thanks for shopping at JiFire!` }),
+    ckb: (n) => ({ title: 'داواکارییەکەت لە ڕێگادایە 🚚', body: `داواکاری ${n} نێردرا بۆ گەیاندن و بەم زووانە دەگات. سوپاس بۆ کڕین لە جی فایەر!` }),
+  },
+  delivered: {
+    ar: (n) => ({ title: fill(CFG.texts.deliveredTitle, n), body: fill(CFG.texts.deliveredBody, n) }),
+    en: (n) => ({ title: 'Your order was delivered 🎉', body: `Order ${n} was delivered. Thanks for shopping at JiFire!` }),
+    ckb: (n) => ({ title: 'داواکارییەکەت گەیەندرا 🎉', body: `داواکاری ${n} بە سەرکەوتوویی گەیەندرا. سوپاس بۆ کڕین لە جی فایەر!` }),
+  },
+  cancelled: {
+    ar: (n) => ({ title: fill(CFG.texts.cancelledTitle, n), body: fill(CFG.texts.cancelledBody, n) }),
+    en: (n) => ({ title: 'Your order was cancelled', body: `Order ${n} was cancelled. For questions, contact us on Facebook or Instagram.` }),
+    ckb: (n) => ({ title: 'داواکارییەکەت هەڵوەشێنرایەوە', body: `داواکاری ${n} هەڵوەشێنرایەوە. بۆ پرسیار لە فەیسبووک یان ئینستاگرام پەیوەندیمان پێوە بکە.` }),
+  },
 };
+const SHIPPED_TEXT = ORDER_TEXT.shipped;
 
+// Orders whose status changed recently (shipped / delivered / cancelled).
 const FULFILLED_QUERY = `
 query Fulfilled($q: String!) {
   orders(first: 50, sortKey: UPDATED_AT, reverse: true, query: $q) {
     nodes {
-      id name updatedAt displayFulfillmentStatus phone
+      id name updatedAt displayFulfillmentStatus phone cancelledAt tags
       customer { defaultPhoneNumber { phoneNumber } }
       shippingAddress { phone }
+      fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
     }
   }
 }`;
@@ -1213,13 +1233,16 @@ async function checkFulfilledOrders() {
       return;
     }
     const since = new Date(Date.parse(op.since) - 2 * 60e3).toISOString(); // small overlap
-    const data = await admin(FULFILLED_QUERY, { q: `fulfillment_status:shipped updated_at:>'${since}'` });
+    const data = await admin(FULFILLED_QUERY, { q: `updated_at:>'${since}'` });
     let newest = op.since;
     for (const o of data.orders?.nodes || []) {
       if (o.updatedAt > newest) newest = o.updatedAt;
-      if (!['FULFILLED', 'PARTIALLY_FULFILLED'].includes(o.displayFulfillmentStatus)) continue;
-      if (op.done[o.id] || o.updatedAt < since) continue;
-      op.done[o.id] = Date.now();
+      const st = orderStep(o);
+      if (!ORDER_TEXT[st.status] || o.updatedAt < since) continue;
+      // One push per order per status (older state used the bare id for "shipped").
+      const key = `${o.id}:${st.status}`;
+      if (op.done[key] || (st.status === 'shipped' && op.done[o.id])) continue;
+      op.done[key] = Date.now();
       const phones = new Set(
         [o.phone, o.customer?.defaultPhoneNumber?.phoneNumber, o.shippingAddress?.phone]
           .map(normalizePhone)
@@ -1227,12 +1250,13 @@ async function checkFulfilledOrders() {
       );
       for (const ph of phones) {
         for (const dev of [...(state.push[ph] || [])]) {
-          const msg = (SHIPPED_TEXT[dev.lang] || SHIPPED_TEXT.ar)(o.name);
-          // Data-only: the app shows its live order tracker (step 3 of 4).
+          const texts = ORDER_TEXT[st.status];
+          const msg = (texts[dev.lang] || texts.ar)(o.name);
+          // Data-only: the app updates its live order tracker (0 = cancelled, 3 = on the way, 4 = delivered).
           const r = await sendPush(dev.token, {
             ...msg,
             dataOnly: true,
-            data: { type: 'order', status: 'shipped', step: 3, order: o.name },
+            data: { type: 'order', status: st.status, step: st.step, order: o.name },
           });
           if (r === 'invalid') unregisterPushToken(dev.token);
           log('order push', o.name, ph.slice(-4), r);
@@ -2202,6 +2226,10 @@ async function handleConfig() {
       receivedBody: CFG.texts.receivedBody,
       shippedTitle: CFG.texts.shippedTitle,
       shippedBody: CFG.texts.shippedBody,
+      deliveredTitle: CFG.texts.deliveredTitle,
+      deliveredBody: CFG.texts.deliveredBody,
+      cancelledTitle: CFG.texts.cancelledTitle,
+      cancelledBody: CFG.texts.cancelledBody,
     },
     delivery: {
       defaultFee: CFG.defaultDeliveryFee,
@@ -2393,6 +2421,10 @@ const EDITABLE = [
   ['MSG_RECEIVED_BODY', 'إشعار استلام الطلب: النص', false],
   ['MSG_SHIPPED_TITLE', 'إشعار خروج الطلب للتوصيل: العنوان ({order} = رقم الطلب)', false],
   ['MSG_SHIPPED_BODY', 'إشعار خروج الطلب للتوصيل: النص ({order} = رقم الطلب)', false],
+  ['MSG_DELIVERED_TITLE', 'إشعار تسليم الطلب: العنوان ({order} = رقم الطلب)', false],
+  ['MSG_DELIVERED_BODY', 'إشعار تسليم الطلب: النص ({order} = رقم الطلب)', false],
+  ['MSG_CANCELLED_TITLE', 'إشعار إلغاء الطلب: العنوان ({order} = رقم الطلب)', false],
+  ['MSG_CANCELLED_BODY', 'إشعار إلغاء الطلب: النص ({order} = رقم الطلب)', false],
   ['AI_API_KEY', 'مفتاح الذكاء الاصطناعي (Gemini API key)', true],
   ['FIREBASE_SERVICE_ACCOUNT', 'مفتاح خدمة Firebase (ملف JSON) لإشعارات حالة الطلب', true],
   ['AI_MODEL', 'نموذج الذكاء الاصطناعي (اتركه فارغاً للافتراضي)', false],
