@@ -1744,7 +1744,24 @@ const server = http.createServer(async (req, res) => {
       checkAppKey(req);
       const phone = readSession(req);
       if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
-      return send(res, 200, { phone });
+      return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true });
+    }
+
+    if (req.method === 'POST' && p === '/api/auth/consent') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'consent', 10, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      if (typeof body?.whatsapp !== 'boolean') throw new AppError(400, 'طلب غير صالح');
+      recordConsent(phone, body.whatsapp);
+      syncConsent(phone);
+      return send(res, 200, { whatsappConsent: body.whatsapp });
     }
 
     if (p === '/admin' && req.method === 'GET') {
