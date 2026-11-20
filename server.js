@@ -50,6 +50,14 @@ const CFG = {
   clientSecret: env('SHOPIFY_CLIENT_SECRET'),
   staticToken: env('SHOPIFY_ADMIN_TOKEN'), // optional: legacy shpat_ token
   adminBase: env('SHOPIFY_ADMIN_BASE'), // tests only
+  // Shopping assistant. Any OpenAI-compatible API (Gemini, Groq, OpenRouter...).
+  // Without a key the assistant still works as a free smart search.
+  ai: {
+    key: env('AI_API_KEY'),
+    url: env('AI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
+    model: env('AI_MODEL', 'gemini-flash-lite-latest'),
+    perIp10min: Number(env('AI_PER_IP_10MIN', '15')),
+  },
   sendReceipt: bool('SEND_ORDER_RECEIPT', false),
   upsertCustomer: bool('UPSERT_CUSTOMER', true),
   orderTag: env('ORDER_TAG', 'تطبيق جي فاير'),
@@ -639,6 +647,323 @@ async function handleBanners() {
   banners.sort((a, b) => a.sort - b.sort);
   bannersCache = { at: Date.now(), data: { banners } };
   return bannersCache.data;
+}
+
+
+// ------------------------------------------------------ shopping assistant ---
+// Answers from the store's own catalog. Products come from the Storefront API
+// (what the app shows), ranked locally; an AI model (optional) writes the reply.
+
+const SF_CATALOG_QUERY = `
+query Catalog($after: String) {
+  products(first: 60, after: $after, query: "available_for_sale:true") {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      handle title vendor productType availableForSale
+      description(truncateAt: 360)
+      featuredImage { url }
+      priceRange { minVariantPrice { amount } maxVariantPrice { amount } }
+      compareAtPriceRange { maxVariantPrice { amount } }
+      variants(first: 12) { nodes { title availableForSale price { amount } } }
+    }
+  }
+}`;
+let catalogCache = { at: 0, items: [], loading: null };
+
+async function storefront(query, variables) {
+  const base = CFG.adminBase || `https://${CFG.shop}`;
+  const res = await fetch(`${base}/api/2026-07/graphql.json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query, variables }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || j.errors) throw new Error(`storefront ${res.status} ${JSON.stringify(j.errors || '').slice(0, 200)}`);
+  return j.data;
+}
+
+const AR_DIGITS = /[٠-٩۰-۹]/g;
+function normText(s) {
+  return String(s || '')
+    .replace(AR_DIGITS, (d) => String((d.charCodeAt(0) & 0xf) % 10))
+    .toLowerCase()
+    .replace(/[ً-ْـ]/g, '')
+    .replace(/[إأآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/ک/g, 'ك')
+    .replace(/[^\p{L}\p{N}+]+/gu, ' ')
+    .trim();
+}
+
+// Arabic / Kurdish words -> words that appear in product titles.
+const AI_SYNONYMS = {
+  'ايفون': 'iphone', 'آيفون': 'iphone', 'ئایفۆن': 'iphone', 'ابل': 'apple', 'ايباد': 'ipad',
+  'سامسونج': 'samsung', 'سامسونك': 'samsung', 'سامسونگ': 'samsung', 'كلكسي': 'galaxy', 'جالكسي': 'galaxy',
+  'شاومي': 'xiaomi', 'ريدمي': 'redmi', 'هونر': 'honor', 'هواوي': 'huawei', 'تكنو': 'tecno',
+  'انفنكس': 'infinix', 'انفينكس': 'infinix', 'ريلمي': 'realme', 'اوبو': 'oppo', 'فيفو': 'vivo', 'نوكيا': 'nokia',
+  'برو': 'pro', 'ماكس': 'max', 'الترا': 'ultra', 'التra': 'ultra', 'بلس': 'plus', 'ميني': 'mini', 'لايت': 'lite',
+  'شاحن': 'شاحن charger', 'شواحن': 'شاحن charger', 'كيبل': 'كابل cable', 'كابل': 'كابل cable',
+  'سماعه': 'سماعه headphone earbuds airpods', 'سماعات': 'سماعه headphone earbuds airpods', 'ايربودز': 'airpods',
+  'ساعه': 'ساعه watch', 'ساعات': 'ساعه watch', 'تابلت': 'تابلت tablet', 'لوحي': 'tablet',
+  'كفر': 'كفر case', 'لاصق': 'لاصق protector', 'باور': 'باور power bank', 'بانك': 'bank',
+  'لابتوب': 'لابتوب laptop', 'بلايستيشن': 'playstation', 'مستعمل': 'مستعمل used',
+  'جيجا': 'gb', 'كيكا': 'gb', 'گیگا': 'gb', 'رام': 'ram', 'مۆبایل': 'هاتف phone', 'موبايل': 'هاتف phone',
+};
+const AI_STOP = new Set(('اريد عندكم عندك شنو شو ما هو هي في من على عن الى او و يا لو هل كم اكو ' +
+  'احسن افضل سعر اسعار بكم بس جهاز اجهزه موجود متوفر ممكن اشتري ابي ابغى بدي الي اللي هذا هاي ' +
+  'تحت اقل اكثر فوق حدود بحدود ميزانيتي ميزانيه دينار الف مليون مليونين ونص ربع ' +
+  'what is the a an do you have best price under below over for with i want need show me').split(' '));
+
+function parseBudget(q) {
+  const t = normText(q);
+  const units = (n, u) => n * (/مليون|million|ملیۆن/.test(u) ? 1e6 : /الف|k|thousand|هەزار/.test(u) ? 1e3 : 1);
+  let amount = null;
+  let m = t.match(/(\d+(?:[.,]\d+)?)\s*(مليون|million|ملیۆن|الف|k|thousand|هەزار)/);
+  if (m) amount = units(parseFloat(m[1].replace(',', '.')), m[2]);
+  else if (/مليونين/.test(t)) amount = 2e6;
+  else if (/مليون ونص|مليون و نص/.test(t)) amount = 1.5e6;
+  else if (/نص مليون/.test(t)) amount = 5e5;
+  else if (/(^| )مليون( |$)/.test(t)) amount = 1e6;
+  else if ((m = t.match(/(^| )(\d{6,8})( |$)/))) amount = Number(m[2]);
+  if (!amount) return null;
+  const over = /فوق|اكثر من|اعلى من|over|above|more than|زیاتر/.test(t);
+  const around = /حدود|بحدود|تقريبا|around|about|نزیکەی/.test(t);
+  return over ? { min: amount } : { max: amount * (around ? 1.12 : 1.03) };
+}
+
+/** Each word of the question with its synonyms: [['ايفون','iphone'], ['256']]. */
+function queryGroups(q) {
+  const out = [];
+  const seen = new Set();
+  for (const w of normText(q).split(' ')) {
+    if (!w || AI_STOP.has(w)) continue;
+    const base = w.replace(/^ال/, '');
+    const syn = AI_SYNONYMS[w] || AI_SYNONYMS[base];
+    const group = [...new Set([base.length > 1 ? base : w, ...(syn ? syn.split(' ') : [])])]
+      .filter((x) => x.length > 1 || /\d/.test(x));
+    const key = group.join('|');
+    if (group.length && !seen.has(key)) {
+      seen.add(key);
+      out.push(group);
+    }
+  }
+  return out;
+}
+
+async function loadCatalog() {
+  if (catalogCache.items.length && Date.now() - catalogCache.at < 15 * 60e3) return catalogCache.items;
+  if (catalogCache.loading) return catalogCache.loading;
+  catalogCache.loading = (async () => {
+    const items = [];
+    let after = null;
+    for (let i = 0; i < 25; i++) {
+      const d = await storefront(SF_CATALOG_QUERY, { after });
+      for (const p of d.products.nodes) {
+        const variants = (p.variants?.nodes || []).map((v) => ({
+          title: v.title === 'Default Title' ? '' : v.title,
+          available: v.availableForSale,
+          price: Number(v.price?.amount || 0),
+        }));
+        const text = normText(`${p.title} ${p.vendor} ${p.productType} ${variants.map((v) => v.title).join(' ')}`);
+        items.push({
+          handle: p.handle,
+          title: p.title,
+          vendor: p.vendor || '',
+          type: p.productType || '',
+          image: p.featuredImage?.url || null,
+          min: Number(p.priceRange?.minVariantPrice?.amount || 0),
+          max: Number(p.priceRange?.maxVariantPrice?.amount || 0),
+          compareAt: Number(p.compareAtPriceRange?.maxVariantPrice?.amount || 0),
+          available: p.availableForSale,
+          used: /مستعمل|\bused\b/i.test(p.title),
+          service: /^خدمة |JiFire Cart Addon/i.test(p.title),
+          variants,
+          desc: String(p.description || '').replace(/\s+/g, ' ').trim(),
+          text,
+          order: items.length, // newest first from the API
+        });
+      }
+      if (!d.products.pageInfo.hasNextPage) break;
+      after = d.products.pageInfo.endCursor;
+    }
+    catalogCache = { at: Date.now(), items, loading: null };
+    return items;
+  })().catch((e) => {
+    catalogCache.loading = null;
+    throw e;
+  });
+  return catalogCache.loading;
+}
+
+const ACCESSORY_RX = /شاحن|كابل|كفر|لاصق|سماع|حامل|باور|ستاند|charger|cable|case|protector|holder|stand|power bank|earbuds|headphone/;
+const DEVICE_RX = /هاتف|هواتف|موبايل|جوال|تابلت|ايباد|phone|tablet|ipad|iphone|galaxy/;
+
+function hasTerm(text, t) {
+  // Numbers must match whole ("500" must not match "5000").
+  return /^\d+$/.test(t) ? new RegExp(`(^|[^\\d])${t}(gb|g|w|mah)?([^\\d]|$)`).test(text) : text.includes(t);
+}
+
+/** Best matching products for a question (no AI needed). */
+function rankProducts(items, question, limit = 10) {
+  const nq = normText(question);
+  const budget = parseBudget(question);
+  // "500 الف" is a budget, not a word to look for in titles.
+  const budgetNums = new Set((nq.match(/\d+(?:[.,]\d+)?(?= *(مليون|million|الف|k|thousand|هەزار))/g) || []));
+  const groups = queryGroups(question)
+    .map((g) => g.filter((t) => !budgetNums.has(t)))
+    .filter((g) => g.length);
+  const terms = groups.flat();
+  const wantUsed = /مستعمل|\bused\b|بەکارهاتوو/i.test(question);
+  const cheap = /ارخص|رخيص|اقتصادي|cheap|cheapest|هەرزان/.test(nq);
+  const wantsAccessory = ACCESSORY_RX.test(nq);
+  const wantsDevice = !wantsAccessory && (DEVICE_RX.test(nq) || /جهاز|اجهزه|device/.test(nq) || Boolean(budget));
+  const brandOrModel = terms.length > 0;
+  const pool = items.filter((p) => p.available && !p.service && p.used === wantUsed &&
+    // "best device for 500k": phones/tablets only.
+    !(wantsDevice && !brandOrModel && !DEVICE_RX.test(p.text + ' ' + normText(p.type))));
+  // Rare words count more than common ones (e.g. "iphone" > "مستعمل").
+  const gw = groups.map((g) => {
+    const df = pool.reduce((n, p) => n + (g.some((t) => hasTerm(p.text, t)) ? 1 : 0), 0);
+    return df ? Math.log(1 + pool.length / df) * (g.every((t) => /^\d+$/.test(t)) ? 1.5 : 1) : 0;
+  });
+  const scored = [];
+  for (const p of pool) {
+    const isAccessory = ACCESSORY_RX.test(p.text) || ACCESSORY_RX.test(normText(p.type));
+    if (wantsDevice && isAccessory) continue;
+    if (budget?.max && p.min > budget.max) continue;
+    if (budget?.min && p.max < budget.min) continue;
+    let score = 0;
+    let matched = 0;
+    groups.forEach((g, i) => {
+      // One word counts once, even if several of its synonyms match.
+      if (gw[i] > 0 && g.some((t) => hasTerm(p.text, t))) {
+        matched++;
+        score += gw[i];
+      }
+    });
+    if (groups.length && matched === 0) continue;
+    if (budget?.max) score += 1 - Math.abs(budget.max / 1.03 - p.min) / (budget.max || 1); // close to budget
+    scored.push({ p, score });
+  }
+  scored.sort((a, b) =>
+    b.score - a.score ||
+    (cheap ? a.p.min - b.p.min : 0) ||
+    a.p.order - b.p.order);
+  return scored.slice(0, limit).map((x) => x.p);
+}
+
+const AI_LANG = { ar: 'Arabic (Iraqi-friendly Modern Standard Arabic)', en: 'English', ckb: 'Central Kurdish (Sorani, Arabic script)' };
+const AI_FALLBACK_TEXT = {
+  ar: (n) => (n ? 'هذه أنسب المنتجات المتوفرة لطلبك:' : 'ما لقيت منتج مطابق بالضبط، جرّب تكتب اسم الجهاز أو الماركة أو الميزانية.'),
+  en: (n) => (n ? 'Here are the best matching products in stock:' : "I couldn't find an exact match. Try a device name, brand or budget."),
+  ckb: (n) => (n ? 'ئەمانە گونجاوترین بەرهەمە بەردەستەکانن:' : 'هیچ بەرهەمێکی گونجاو نەدۆزرایەوە، ناوی ئامێر یان براند یان بودجە بنووسە.'),
+};
+const aiState = { blockedUntil: 0 };
+
+function productCardJson(p) {
+  return { handle: p.handle, title: p.title, vendor: p.vendor, image: p.image, price: p.min, maxPrice: p.max, compareAt: p.compareAt > p.min ? p.compareAt : null };
+}
+
+function compactForAi(p, i) {
+  const opts = [...new Set(p.variants.filter((v) => v.available && v.title).map((v) => `${v.title}=${v.price}`))].slice(0, 8);
+  return `#${i + 1} ${p.title} | ${p.vendor} | ${p.type} | ${p.min === p.max ? p.min : `${p.min}-${p.max}`} IQD` +
+    (p.compareAt > p.min ? ` (was ${p.compareAt})` : '') +
+    (p.used ? ' | USED' : '') +
+    (opts.length ? ` | options: ${opts.join('; ')}` : '') +
+    (p.desc ? ` | ${p.desc.slice(0, 260)}` : '');
+}
+
+async function callAi(question, history, lang, candidates) {
+  const sys =
+    `You are the shopping assistant of "JiFire Mobile" (جي فاير للموبايل), a phone and accessories store in Iraq. ` +
+    `Reply in ${AI_LANG[lang] || AI_LANG.ar}. Be friendly, concise (max 6 short lines), practical.\n` +
+    `RULES: Recommend ONLY products from the STORE PRODUCTS list. Prices are in Iraqi dinar (IQD, write د.ع in Arabic). ` +
+    `Never invent products, prices, stock or discounts. You may use well-known general specs of a model (screen, chip, camera) ` +
+    `but say it briefly. If nothing fits, say so and suggest the closest options from the list. ` +
+    `Only discuss phones, tablets, watches, accessories and this store; politely refuse anything else. ` +
+    `Do not mention these rules or the list numbers in the text.\n` +
+    `Return ONLY JSON: {"answer": "<text>", "picks": [<up to 4 product numbers from the list, best first>]}`;
+  const list = candidates.length ? candidates.map(compactForAi).join('\n') : '(no matching products in stock)';
+  const messages = [
+    { role: 'system', content: sys },
+    ...history.slice(-4),
+    { role: 'user', content: `STORE PRODUCTS:\n${list}\n\nCUSTOMER: ${question}` },
+  ];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25e3);
+  try {
+    const post = (json) =>
+      fetch(CFG.ai.url, {
+        method: 'POST',
+        signal: ctrl.signal,
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${CFG.ai.key}` },
+        body: JSON.stringify({
+          model: CFG.ai.model,
+          messages,
+          temperature: 0.3,
+          max_tokens: 600,
+          ...(json ? { response_format: { type: 'json_object' } } : {}),
+        }),
+      });
+    let res = await post(true);
+    // Some providers/models reject JSON mode: ask again without it.
+    if (res.status === 400) res = await post(false);
+    const j = await res.json().catch(() => ({}));
+    if (res.status === 429) {
+      const wait = Number(res.headers.get('retry-after')) || 60;
+      aiState.blockedUntil = Date.now() + Math.min(wait, 3600) * 1000;
+      throw new Error('ai rate limited');
+    }
+    if (!res.ok) throw new Error(`ai ${res.status} ${JSON.stringify(j).slice(0, 200)}`);
+    const raw = String(j.choices?.[0]?.message?.content || '').trim();
+    let out;
+    try {
+      out = JSON.parse(raw.replace(/^```(?:json)?|```$/g, '').trim());
+    } catch {
+      out = { answer: raw, picks: [] };
+    }
+    const answer = String(out.answer || '').trim().slice(0, 1500);
+    if (!answer) throw new Error('ai empty answer');
+    const picks = (Array.isArray(out.picks) ? out.picks : [])
+      .map((n) => candidates[Number(n) - 1])
+      .filter(Boolean);
+    return { answer, picks: [...new Set(picks)].slice(0, 4) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleAiAsk(body, ip) {
+  const question = String(body?.question || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (question.length < 2) throw new AppError(400, 'اكتب سؤالك');
+  const lang = ['ar', 'en', 'ckb'].includes(body?.lang) ? body.lang : 'ar';
+  const history = (Array.isArray(body?.history) ? body.history : [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+    .slice(-4)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 400) }));
+  const items = await loadCatalog();
+  // Follow-up questions ("وبكم الأصغر؟") still search with the previous question.
+  const lastUser = [...history].reverse().find((m) => m.role === 'user')?.content || '';
+  let candidates = rankProducts(items, question, 10);
+  if (candidates.length < 3 && lastUser) {
+    const more = rankProducts(items, `${lastUser} ${question}`, 10);
+    candidates = [...new Map([...candidates, ...more].map((p) => [p.handle, p])).values()].slice(0, 10);
+  }
+  if (CFG.ai.key && Date.now() > aiState.blockedUntil) {
+    try {
+      const r = await callAi(question, history, lang, candidates);
+      return {
+        mode: 'ai',
+        answer: r.answer,
+        products: (r.picks.length ? r.picks : []).map(productCardJson),
+      };
+    } catch (e) {
+      log('ai failed, using smart search', String(e.message || e).slice(0, 200));
+    }
+  }
+  const top = candidates.slice(0, 6);
+  return { mode: 'search', answer: AI_FALLBACK_TEXT[lang](top.length), products: top.map(productCardJson) };
 }
 
 const PAYMENT_LABEL = {
@@ -1528,6 +1853,7 @@ async function handleConfig() {
     governorates: WASEET.map((c) => c.name),
     waseet: true,
     discounts: true,
+    assistant: { ai: Boolean(CFG.ai.key) },
     delivery: {
       defaultFee: CFG.defaultDeliveryFee,
       fees: CFG.deliveryFees,
@@ -1712,6 +2038,9 @@ const EDITABLE = [
   ['MSG91_WA_LANG', 'لغة القالب (ar أو en)', false],
   ['OTP_TEST_PHONE', 'رقم تجربة (اختياري)', false],
   ['OTP_TEST_CODE', 'رمز تجربة (اختياري)', true],
+  ['AI_API_KEY', 'مفتاح الذكاء الاصطناعي (Gemini API key)', true],
+  ['AI_MODEL', 'نموذج الذكاء الاصطناعي (اتركه فارغاً للافتراضي)', false],
+  ['AI_API_URL', 'رابط API (اتركه فارغاً لـ Gemini)', false],
   ['HYPERPAY_HOST', 'HyperPay Host', false],
   ['HYPERPAY_ENTITY_ID', 'HyperPay Entity ID', false],
   ['HYPERPAY_ACCESS_TOKEN', 'HyperPay Access Token', true],
@@ -1758,6 +2087,7 @@ button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;fo
 <body><div class="w"><h1>إعدادات خادم جي فاير</h1>
 <div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 تسجيل الدخول برمز SMS: <b>${otpChannels().includes('sms') ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+المساعد الذكي: <b>${CFG.ai.key ? 'AI مفعّل ✅ (' + escapeHtml(CFG.ai.model) + ')' : 'بحث ذكي مجاني (بدون مفتاح AI)'}</b><br>
 رمز الدخول عبر واتساب: <b>${whatsappOtpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(aqsatiDemo() ? '(وضع تجربة)' : (() => { try { return new URL(CFG.aqsati.apiBase).host; } catch { return ''; } })())}</span><br>
 عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
@@ -1921,6 +2251,18 @@ const server = http.createServer(async (req, res) => {
         log('me profile lookup failed', String(e.message || e).slice(0, 200));
       }
       return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true, profile });
+    }
+
+    if (req.method === 'POST' && p === '/api/ai/ask') {
+      checkAppKey(req);
+      rateLimit(clientIp(req), 'ai', CFG.ai.perIp10min, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, 16 * 1024));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, await handleAiAsk(body, clientIp(req)));
     }
 
     if (req.method === 'GET' && p === '/api/banners') {
