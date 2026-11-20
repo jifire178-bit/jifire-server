@@ -1847,7 +1847,20 @@ const server = http.createServer(async (req, res) => {
       checkAppKey(req);
       const phone = readSession(req);
       if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
-      return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true });
+      let profile = null;
+      try {
+        const c = await customerByPhone(phone);
+        if (c) {
+          profile = {
+            name: [c.firstName, c.lastName].filter(Boolean).join(' ').trim(),
+            email: c.defaultEmailAddress?.emailAddress || '',
+            orders: Number(c.numberOfOrders || 0),
+          };
+        }
+      } catch (e) {
+        log('me profile lookup failed', String(e.message || e).slice(0, 200));
+      }
+      return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true, profile });
     }
 
     if (req.method === 'POST' && p === '/api/auth/profile') {
