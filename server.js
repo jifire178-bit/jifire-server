@@ -698,10 +698,13 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   // customer instead of creating a duplicate (e.g. matched by email only).
   let existingId = null;
   if (CFG.upsertCustomer) {
-    existingId = await customerIdByPhone(order.customer.phone).catch((e) => {
-      log('customer lookup failed', String(e.message || e).slice(0, 200));
-      return null;
-    });
+    try {
+      existingId =
+        (await customerIdByPhone(order.customer.phone)) ||
+        (await createCustomerForPhone(order.customer.phone, order.customer.name, order.customer.email));
+    } catch (e) {
+      log('customer lookup/create failed', String(e.message || e).slice(0, 200));
+    }
   }
   if (existingId) {
     input.customer = { toAssociate: { id: existingId } };
@@ -952,14 +955,43 @@ async function sendWhatsappOtp(phone) {
 // ---- WhatsApp marketing consent -> Shopify customer
 const CUSTOMER_BY_PHONE = `
 query CustomerByPhone($q: String!) {
-  customers(first: 20, query: $q) { nodes { id defaultPhoneNumber { phoneNumber } } }
+  customers(first: 20, query: $q) {
+    nodes {
+      id firstName lastName numberOfOrders
+      defaultPhoneNumber { phoneNumber }
+      defaultEmailAddress { emailAddress }
+    }
+  }
 }`;
 
-/** Shopify's phone search is fuzzy: only accept an exact number match. */
-async function customerIdByPhone(phone) {
+/** The Shopify customer that owns exactly this phone (search is fuzzy). */
+async function customerByPhone(phone) {
   const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
-  const hit = (found.customers?.nodes || []).find((n) => n.defaultPhoneNumber?.phoneNumber === phone);
-  return hit?.id || null;
+  const hits = (found.customers?.nodes || []).filter((n) => n.defaultPhoneNumber?.phoneNumber === phone);
+  // Several with the same number (old duplicates): keep the one with most orders.
+  hits.sort((a, b) => Number(b.numberOfOrders || 0) - Number(a.numberOfOrders || 0));
+  return hits[0] || null;
+}
+
+async function customerIdByPhone(phone) {
+  return (await customerByPhone(phone))?.id || null;
+}
+
+/** New phone: create its own customer (never merge into an email owner). */
+async function createCustomerForPhone(phone, name, email) {
+  const [firstName, ...rest] = String(name || '').trim().split(/\s+/);
+  const base = {
+    phone,
+    ...(firstName ? { firstName, lastName: rest.join(' ') || firstName } : {}),
+    tags: ['تطبيق جي فاير', ...(state.consent?.[phone]?.wa ? [WA_TAG] : [])],
+  };
+  for (const input of email ? [{ ...base, email }, base] : [base]) {
+    const r = await admin(CUSTOMER_CREATE, { input });
+    const id = r.customerCreate?.customer?.id;
+    if (id) return id;
+    log('customerCreate', JSON.stringify(r.customerCreate?.userErrors).slice(0, 300));
+  }
+  return null;
 }
 const CUSTOMER_CREATE = `
 mutation CustomerCreate($input: CustomerInput!) {
@@ -974,6 +1006,47 @@ mutation WaConsent($input: CustomerWhatsAppMarketingConsentUpdateInput!) {
   customerWhatsAppMarketingConsentUpdate(input: $input) { userErrors { field message } }
 }`;
 const WA_TAG = 'موافق عروض واتساب';
+const CUSTOMER_UPDATE = `
+mutation CustomerUpdate($input: CustomerInput!) {
+  customerUpdate(input: $input) { customer { id } userErrors { field message } }
+}`;
+
+/** "حسابي → تعديل بياناتي": update the Shopify customer that owns this phone. */
+async function handleProfile(phone, body) {
+  const name = String(body?.name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  const email = String(body?.email || '').trim().slice(0, 120);
+  if (name.length < 3) throw new AppError(400, 'اكتب اسمك الكامل');
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new AppError(400, 'البريد الإلكتروني غير صحيح');
+  const [firstName, ...rest] = name.split(' ');
+  const lastName = rest.join(' ') || firstName;
+  let id = await customerIdByPhone(phone);
+  if (!id) {
+    const made = await admin(CUSTOMER_CREATE, {
+      input: { phone, firstName, lastName, tags: ['تطبيق جي فاير'], ...(email ? { email } : {}) },
+    });
+    id = made.customerCreate?.customer?.id;
+    if (!id) {
+      log('profile create', JSON.stringify(made.customerCreate?.userErrors).slice(0, 300));
+      throw new AppError(502, 'تعذّر حفظ البيانات في المتجر');
+    }
+    return { ok: true, emailSaved: Boolean(email) };
+  }
+  let r = await admin(CUSTOMER_UPDATE, { input: { id, firstName, lastName, ...(email ? { email } : {}) } });
+  let errs = r.customerUpdate?.userErrors || [];
+  let emailSaved = Boolean(email);
+  if (errs.length && email) {
+    // e.g. the email already belongs to another customer: keep the name at least.
+    log('profile update (with email)', JSON.stringify(errs).slice(0, 300));
+    r = await admin(CUSTOMER_UPDATE, { input: { id, firstName, lastName } });
+    errs = r.customerUpdate?.userErrors || [];
+    emailSaved = false;
+  }
+  if (errs.length) {
+    log('profile update', JSON.stringify(errs).slice(0, 300));
+    throw new AppError(502, 'تعذّر حفظ البيانات في المتجر');
+  }
+  return { ok: true, emailSaved };
+}
 
 function recordConsent(phone, agreed) {
   if (typeof agreed !== 'boolean') return;
@@ -1098,7 +1171,20 @@ async function handleOtpVerify(body, ip) {
     recordConsent(phone, body.whatsappConsent);
     syncConsent(phone); // in the background
   }
-  return { token: signSession(phone), phone, expiresInDays: CFG.otp.sessionDays };
+  let profile = null;
+  try {
+    const c = await customerByPhone(phone);
+    if (c) {
+      profile = {
+        name: [c.firstName, c.lastName].filter(Boolean).join(' ').trim(),
+        email: c.defaultEmailAddress?.emailAddress || '',
+        orders: Number(c.numberOfOrders || 0),
+      };
+    }
+  } catch (e) {
+    log('login profile lookup failed', String(e.message || e).slice(0, 200));
+  }
+  return { token: signSession(phone), phone, expiresInDays: CFG.otp.sessionDays, profile };
 }
 
 // --------------------------------------------------------------- aqsati ---
@@ -1762,6 +1848,20 @@ const server = http.createServer(async (req, res) => {
       const phone = readSession(req);
       if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
       return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true });
+    }
+
+    if (req.method === 'POST' && p === '/api/auth/profile') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'profile', 10, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, await handleProfile(phone, body));
     }
 
     if (req.method === 'POST' && p === '/api/auth/consent') {
