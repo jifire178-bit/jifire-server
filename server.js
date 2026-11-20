@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.6.9';
+const APP_RELEASE = '3.7.0';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -1663,6 +1663,120 @@ async function placeOrderWithPoints(order) {
   });
 }
 
+
+// ------------------------------------------------- product alerts + links ---
+// "نبّهني لما يتوفر" / "نبّهني لما ينزل السعر": saved per push token (no login
+// needed). A background job checks the products and pushes once it happens.
+
+const WATCH_PRODUCTS = (aliases) => `query Watch { ${aliases} }`;
+const watchFields = 'handle title availableForSale featuredImage { url } priceRange { minVariantPrice { amount } }';
+
+function watchList() {
+  state.watches = state.watches || {};
+  return state.watches;
+}
+
+function handleWatch(body) {
+  const token = String(body?.token || '');
+  const handle = String(body?.handle || '').toLowerCase();
+  const kind = body?.kind === 'price' ? 'price' : 'stock';
+  if (token.length < 20 || token.length > 4096) throw new AppError(400, 'جهاز غير معروف');
+  if (!/^[a-z0-9][a-z0-9-]{0,199}$/.test(handle)) throw new AppError(400, 'منتج غير صالح');
+  const all = watchList();
+  const mine = (all[token] = (all[token] || []).filter((w) => !(w.handle === handle && w.kind === kind)));
+  if (body?.on !== false) {
+    if (mine.length >= 60) throw new AppError(400, 'وصلت للحد الأقصى من التنبيهات');
+    mine.push({ handle, kind, price: Number(body?.price) || 0, title: String(body?.title || '').slice(0, 120), at: Date.now() });
+  }
+  if (!mine.length) delete all[token];
+  saveState();
+  return { ok: true, watches: mine.map(({ handle: h, kind: k }) => ({ handle: h, kind: k })) };
+}
+
+function listWatches(token) {
+  return { watches: (watchList()[String(token || '')] || []).map(({ handle, kind }) => ({ handle, kind })) };
+}
+
+let watchBusy = false;
+async function checkWatches() {
+  if (watchBusy || !pushEnabled()) return;
+  const all = watchList();
+  const handles = [...new Set(Object.values(all).flat().map((w) => w.handle))];
+  if (!handles.length) return;
+  watchBusy = true;
+  try {
+    const info = {};
+    for (let i = 0; i < handles.length; i += 20) {
+      const chunk = handles.slice(i, i + 20);
+      const q = chunk.map((h, j) => `p${j}: product(handle: ${JSON.stringify(h)}) { ${watchFields} }`).join('\n');
+      const d = await storefront(WATCH_PRODUCTS(q), {});
+      chunk.forEach((h, j) => (info[h] = d[`p${j}`] || null));
+    }
+    let changed = false;
+    for (const [token, list] of Object.entries(all)) {
+      const keep = [];
+      for (const w of list) {
+        const p = info[w.handle];
+        if (!p) {
+          // product deleted: drop the alert after a week
+          if (Date.now() - w.at < 7 * 86400e3) keep.push(w);
+          else changed = true;
+          continue;
+        }
+        const price = Number(p.priceRange?.minVariantPrice?.amount || 0);
+        let msg = null;
+        if (w.kind === 'stock' && p.availableForSale) {
+          msg = { title: 'رجع للمخزون ✅', body: `${p.title} متوفر الآن، اطلبه قبل أن ينفد!` };
+        } else if (w.kind === 'price' && w.price > 0 && price > 0 && price < w.price * 0.995) {
+          msg = { title: 'نزل السعر 🔻', body: `${p.title} صار بـ ${formatIqd(price)} بدل ${formatIqd(w.price)}` };
+        }
+        if (!msg) {
+          keep.push(w);
+          continue;
+        }
+        const r = await sendPush(token, { ...msg, data: { type: 'product', product: w.handle, image: p.featuredImage?.url || '' } });
+        log('watch push', w.kind, w.handle, r);
+        changed = true;
+        if (r === 'invalid') {
+          keep.length = 0;
+          break;
+        }
+        // price alerts keep watching from the new price; stock alerts are done
+        if (w.kind === 'price') keep.push({ ...w, price, at: Date.now() });
+      }
+      if (keep.length) all[token] = keep;
+      else delete all[token];
+    }
+    if (changed) saveState();
+  } catch (e) {
+    log('watch check failed', String(e.message || e).slice(0, 300));
+  } finally {
+    watchBusy = false;
+  }
+}
+if (require.main === module || process.env.WATCH_INTERVAL_MS) {
+  setInterval(checkWatches, Number(env('WATCH_INTERVAL_MS', String(10 * 60e3)))).unref();
+}
+
+// Share links: https://<server>/p/<handle> opens the app when installed
+// (Android App Links), otherwise the product on the online store.
+const STORE_WEB = env('STORE_WEB_URL', 'https://jifirephone.com').replace(/\/+$/, '');
+function assetLinks() {
+  const prints = env(
+    'APP_CERT_SHA256',
+    '3A:33:0D:20:9E:FE:9B:3C:F7:CB:E7:DC:6D:69:06:85:F5:7E:F3:B6:A7:E3:4C:CD:36:6C:F7:7D:57:28:AF:F5'
+  )
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return [
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: { namespace: 'android_app', package_name: 'com.jifirephone.jifire_native', sha256_cert_fingerprints: prints },
+    },
+  ];
+}
+
 // ---------------------------------------------------------- my orders ---
 // "طلباتي" / order tracking in the app: the logged-in phone's Shopify orders
 // with a 4-step status (received → preparing → on the way → delivered).
@@ -2625,6 +2739,8 @@ async function handleConfig() {
     waseet: true,
     discounts: true,
     loyalty: loyaltyRules(),
+    installments: aqsatiEnabled() ? CFG.aqsati.plans.map(([months, rate]) => ({ months, rate })) : [],
+    shareBase: CFG.publicUrl,
     assistant: { ai: Boolean(CFG.ai.key) },
     texts: {
       receivedTitle: CFG.texts.receivedTitle,
@@ -3403,6 +3519,38 @@ const server = http.createServer(async (req, res) => {
       return res.end(UPDATE_BANNER_JPG);
     }
 
+    if (req.method === 'GET' && p === '/.well-known/assetlinks.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' });
+      return res.end(JSON.stringify(assetLinks()));
+    }
+
+    {
+      const sm = /^\/(p|c)\/([a-z0-9][a-z0-9-]{0,199})$/i.exec(p);
+      if (req.method === 'GET' && sm) {
+        // Browser (app not installed): the same product on the online store.
+        const dest = `${STORE_WEB}/${sm[1] === 'p' ? 'products' : 'collections'}/${sm[2].toLowerCase()}`;
+        res.writeHead(302, { Location: dest, 'Cache-Control': 'no-store' });
+        return res.end();
+      }
+    }
+
+    if (req.method === 'POST' && p === '/api/watch') {
+      checkAppKey(req);
+      rateLimit(clientIp(req), 'watch', 60, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, 8192));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, handleWatch(body));
+    }
+
+    if (req.method === 'GET' && p === '/api/watch') {
+      checkAppKey(req);
+      return send(res, 200, listWatches(url.searchParams.get('token')));
+    }
+
     if (req.method === 'GET' && p === '/api/app/status') {
       checkAppKey(req);
       return send(res, 200, appStatus(req));
@@ -3704,4 +3852,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+module.exports = { handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
