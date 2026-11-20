@@ -106,6 +106,12 @@ const CFG = {
     testPhone: env('OTP_TEST_PHONE'),
     testCode: env('OTP_TEST_CODE'),
     sessionDays: Number(env('SESSION_DAYS', '90')),
+    // WhatsApp OTP via MSG91 (approved Authentication template).
+    waNumber: env('MSG91_WA_NUMBER').replace(/\D/g, ''),
+    waTemplate: env('MSG91_WA_TEMPLATE'),
+    waNamespace: env('MSG91_WA_NAMESPACE'),
+    waLang: env('MSG91_WA_LANG', 'ar'),
+    waButton: env('MSG91_WA_BUTTON', '1') !== '0',
   },
   dataDir: env('DATA_DIR', path.join(__dirname, 'data')),
   ordersPerIp: Number(env('ORDERS_PER_IP_10MIN', '6')),
@@ -237,7 +243,7 @@ query Variants($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProductVariant {
       id title sku price availableForSale
-      product { title status productType }
+      product { id title status productType }
     }
   }
 }`;
@@ -245,7 +251,7 @@ query Variants($ids: [ID!]!) {
 const ORDER_CREATE = `
 mutation OrderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
   orderCreate(order: $order, options: $options) {
-    order { id name totalPriceSet { shopMoney { amount currencyCode } } }
+    order { id name customer { id } totalPriceSet { shopMoney { amount currencyCode } } }
     userErrors { field message }
   }
 }`;
@@ -344,6 +350,7 @@ async function priceCart(lines) {
       quantity: l.quantity,
       title: v.product.title,
       variantTitle: v.title === 'Default Title' ? '' : v.title,
+      productId: v.product.id,
       price: Number(v.price),
       productType: v.product.productType,
       addons: l.addons,
@@ -386,6 +393,194 @@ function deliveryFee(order, subtotal) {
   return CFG.deliveryFees[g] ?? CFG.defaultDeliveryFee;
 }
 
+
+// ------------------------------------------------------- discount codes ---
+// Shopify discount codes, checked and calculated here (never by the app).
+
+const DISCOUNT_QUERY = `
+query DiscountByCode($code: String!) {
+  codeDiscountNodeByCode(code: $code) {
+    id
+    codeDiscount {
+      __typename
+      ... on DiscountCodeBasic {
+        title status usageLimit asyncUsageCount appliesOncePerCustomer
+        context { __typename }
+        minimumRequirement {
+          __typename
+          ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+          ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+        }
+        customerGets {
+          value {
+            __typename
+            ... on DiscountPercentage { percentage }
+            ... on DiscountAmount { amount { amount } appliesOnEachItem }
+          }
+          items {
+            __typename
+            ... on DiscountProducts {
+              products(first: 250) { nodes { id } }
+              productVariants(first: 250) { nodes { id } }
+            }
+            ... on DiscountCollections { collections(first: 50) { nodes { id } } }
+          }
+        }
+      }
+      ... on DiscountCodeFreeShipping {
+        title status usageLimit asyncUsageCount appliesOncePerCustomer
+        context { __typename }
+        maximumShippingPrice { amount }
+        minimumRequirement {
+          __typename
+          ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+          ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+        }
+      }
+    }
+  }
+}`;
+
+const PRODUCT_COLLECTIONS_QUERY = `
+query DiscountCollections($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProductVariant { id product { id collections(first: 50) { nodes { id } } } }
+  }
+}`;
+
+function cleanCode(c) {
+  return String(c || '').trim().replace(/\s+/g, '').slice(0, 40);
+}
+
+/**
+ * Checks `code` against the priced cart and returns
+ * { code, title, amount, freeShipping } or throws an AppError in Arabic.
+ * Service lines (cover / protector) are not discounted.
+ */
+async function evaluateDiscount(code, priced, order) {
+  code = cleanCode(code);
+  if (!code) return null;
+  let data;
+  try {
+    data = await admin(DISCOUNT_QUERY, { code });
+  } catch (e) {
+    if (e.shopify) {
+      log('discount lookup denied', JSON.stringify(e.shopify).slice(0, 300));
+      throw new AppError(503, 'أكواد الخصم غير مفعّلة بعد في المتجر (صلاحية read_discounts)');
+    }
+    throw e;
+  }
+  const d = data.codeDiscountNodeByCode?.codeDiscount;
+  if (!d) throw new AppError(400, 'كود الخصم غير صحيح');
+  if (d.__typename !== 'DiscountCodeBasic' && d.__typename !== 'DiscountCodeFreeShipping') {
+    throw new AppError(400, 'هذا النوع من الخصم غير متاح في التطبيق، استخدمه من الموقع');
+  }
+  if (d.status !== 'ACTIVE') throw new AppError(400, 'كود الخصم منتهي أو غير مفعّل');
+  if (d.usageLimit != null && d.asyncUsageCount >= d.usageLimit) {
+    throw new AppError(400, 'انتهى عدد مرات استخدام هذا الكود');
+  }
+  const ctx = d.context?.__typename;
+  if (ctx && ctx !== 'DiscountBuyerSelectionAll' && ctx !== 'DiscountMarkets') {
+    throw new AppError(400, 'هذا الكود مخصص لعملاء محددين');
+  }
+  const phone = order?.customer?.phone;
+  if (d.appliesOncePerCustomer && phone && state.discountUses?.[`${code.toLowerCase()}|${phone}`]) {
+    throw new AppError(400, 'استخدمت هذا الكود من قبل');
+  }
+
+  const goods = priced.items.filter((i) => !i.service);
+  const goodsTotal = goods.reduce((s, i) => s + i.price * i.quantity, 0);
+  const goodsQty = goods.reduce((s, i) => s + i.quantity, 0);
+
+  let eligible = goods;
+  const items = d.customerGets?.items;
+  if (items?.__typename === 'DiscountProducts') {
+    const pids = new Set(items.products.nodes.map((n) => n.id));
+    const vids = new Set(items.productVariants.nodes.map((n) => n.id));
+    eligible = goods.filter((i) => vids.has(i.variantId) || pids.has(i.productId));
+  } else if (items?.__typename === 'DiscountCollections') {
+    const cids = new Set(items.collections.nodes.map((n) => n.id));
+    const res = await admin(PRODUCT_COLLECTIONS_QUERY, { ids: [...new Set(goods.map((i) => i.variantId))] });
+    const inColl = new Set(
+      (res.nodes || []).filter(Boolean)
+        .filter((n) => (n.product?.collections?.nodes || []).some((c) => cids.has(c.id)))
+        .map((n) => n.id)
+    );
+    eligible = goods.filter((i) => inColl.has(i.variantId));
+  }
+  const eligibleTotal = eligible.reduce((s, i) => s + i.price * i.quantity, 0);
+  const eligibleQty = eligible.reduce((s, i) => s + i.quantity, 0);
+
+  const min = d.minimumRequirement;
+  if (min?.__typename === 'DiscountMinimumSubtotal') {
+    const need = Number(min.greaterThanOrEqualToSubtotal.amount);
+    const base = items?.__typename && items.__typename !== 'AllDiscountItems' ? eligibleTotal : goodsTotal;
+    if (base < need) {
+      throw new AppError(400, `هذا الكود يتطلب مشتريات بقيمة ${need.toLocaleString('en-US')} دينار على الأقل`);
+    }
+  } else if (min?.__typename === 'DiscountMinimumQuantity') {
+    const need = Number(min.greaterThanOrEqualToQuantity);
+    const base = items?.__typename && items.__typename !== 'AllDiscountItems' ? eligibleQty : goodsQty;
+    if (base < need) throw new AppError(400, `هذا الكود يتطلب ${need} قطع على الأقل`);
+  }
+
+  if (d.__typename === 'DiscountCodeFreeShipping') {
+    if (order?.delivery === 'pickup') throw new AppError(400, 'هذا الكود للتوصيل المجاني فقط');
+    const max = d.maximumShippingPrice ? Number(d.maximumShippingPrice.amount) : null;
+    const fee = order ? deliveryFee(order, priced.subtotal) : 0;
+    if (max != null && fee > max) throw new AppError(400, 'التوصيل لهذه المحافظة غير مشمول بهذا الكود');
+    return { code, title: d.title, amount: 0, freeShipping: true };
+  }
+
+  if (!eligible.length) throw new AppError(400, 'الكود لا يشمل المنتجات الموجودة في سلتك');
+  const v = d.customerGets.value;
+  let amount = 0;
+  if (v.__typename === 'DiscountPercentage') {
+    amount = eligibleTotal * Number(v.percentage);
+  } else if (v.__typename === 'DiscountAmount') {
+    const a = Number(v.amount.amount);
+    amount = v.appliesOnEachItem ? a * eligibleQty : a;
+  } else {
+    throw new AppError(400, 'هذا النوع من الخصم غير متاح في التطبيق');
+  }
+  amount = Math.round(Math.min(amount, eligibleTotal));
+  if (amount <= 0) throw new AppError(400, 'الكود لا يشمل المنتجات الموجودة في سلتك');
+  return { code, title: d.title, amount, freeShipping: false };
+}
+
+/** Delivery fee, discount and grand total for a priced order. */
+function orderTotals(order, priced) {
+  const disc = priced.discount;
+  const fee = disc?.freeShipping ? 0 : deliveryFee(order, priced.subtotal);
+  const discount = disc?.amount || 0;
+  return { fee, discount, total: priced.subtotal - discount + fee };
+}
+
+/** Prices the cart and applies the order's discount code, if any. */
+async function priceOrder(order) {
+  const priced = await priceCart(order.lines);
+  if (order.discountCode) priced.discount = await evaluateDiscount(order.discountCode, priced, order);
+  return priced;
+}
+
+async function handleDiscountCheck(body, sessionPhone) {
+  const code = cleanCode(body?.code);
+  if (!code) throw new AppError(400, 'اكتب كود الخصم');
+  const lines = Array.isArray(body?.lines) ? body.lines : [];
+  const order = validateOrder({
+    lines,
+    customer: { name: 'زبون التطبيق', phone: sessionPhone || '07700000000' },
+    delivery: body?.delivery === 'pickup' ? 'pickup' : 'shipping',
+    address: body?.address,
+    payment: 'cod',
+    idempotencyKey: 'discount-check-000000',
+  }, { skipAddress: true, skipPayment: true });
+  if (!sessionPhone) order.customer.phone = null;
+  const priced = await priceCart(order.lines);
+  const d = await evaluateDiscount(code, priced, order);
+  return { code: d.code, title: d.title, amount: d.amount, freeShipping: d.freeShipping };
+}
+
 const PAYMENT_LABEL = {
   cod: 'الدفع عند الاستلام',
   card: 'بطاقة (HyperPay)',
@@ -393,8 +588,8 @@ const PAYMENT_LABEL = {
 };
 
 async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqsati }) {
-  const fee = deliveryFee(order, priced.subtotal);
-  const total = priced.subtotal + fee;
+  const { fee, discount, total } = orderTotals(order, priced);
+  const disc = priced.discount;
   const money = (amount) => ({
     shopMoney: { amount: amount.toFixed(2), currencyCode: priced.currency },
   });
@@ -436,6 +631,12 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: 'الوسيط - المحافظة', value: `${order.address.governorate} (${order.address.cityId})` },
       { key: 'الوسيط - المنطقة', value: `${order.address.area} (${order.address.regionId})` }
     );
+  }
+  const consent = state.consent?.[order.customer.phone];
+  if (consent) attrs.push({ key: 'موافقة عروض واتساب', value: consent.wa ? 'نعم' : 'لا' });
+  if (disc) {
+    attrs.push({ key: 'كود الخصم', value: disc.code + (discount ? ` (-${discount})` : ' (توصيل مجاني)') });
+    tags.push('كود خصم: ' + disc.code);
   }
   if (gatewayRef && order.payment === 'card') attrs.push({ key: 'مرجع HyperPay', value: gatewayRef });
   if (aqsati) {
@@ -485,6 +686,13 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       },
     ],
     ...(address ? { shippingAddress: address, billingAddress: address } : {}),
+    ...(disc
+      ? {
+          discountCode: disc.freeShipping
+            ? { freeShippingDiscountCode: { code: disc.code } }
+            : { itemFixedDiscountCode: { code: disc.code, amountSet: money(discount) } },
+        }
+      : {}),
   };
   if (CFG.upsertCustomer) {
     input.customer = {
@@ -493,6 +701,7 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
         lastName,
         phone: order.customer.phone,
         ...(order.customer.email ? { email: order.customer.email } : {}),
+        ...(state.consent?.[order.customer.phone]?.wa ? { tags: [WA_TAG] } : {}),
       },
     };
   }
@@ -567,7 +776,13 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       (lastErr?.message || 'خطأ من إدارة المتجر') + (detail ? ` (${detail})` : ''));
   }
   const o = data.orderCreate.order;
-  return { orderId: o.id, orderName: o.name, total, deliveryFee: fee, currency: priced.currency };
+  if (consent) syncConsent(order.customer.phone, o.customer?.id || null);
+  if (disc) {
+    state.discountUses = state.discountUses || {};
+    state.discountUses[`${disc.code.toLowerCase()}|${order.customer.phone}`] = Date.now();
+    saveState();
+  }
+  return { orderId: o.id, orderName: o.name, total, discount, deliveryFee: fee, currency: priced.currency };
 }
 
 function aqsatiUrl(order, created) {
@@ -632,8 +847,13 @@ async function hyperpayStatus(checkoutId) {
 
 // ------------------------------------------------------------ otp login ---
 
+const whatsappOtpEnabled = () => Boolean(CFG.otp.authkey && CFG.otp.waNumber && CFG.otp.waTemplate);
 const otpEnabled = () =>
-  Boolean((CFG.otp.authkey && CFG.otp.templateId) || (CFG.otp.testPhone && CFG.otp.testCode));
+  Boolean((CFG.otp.authkey && CFG.otp.templateId) || whatsappOtpEnabled() || (CFG.otp.testPhone && CFG.otp.testCode));
+const otpChannels = () => [
+  ...(CFG.otp.authkey && CFG.otp.templateId ? ['sms'] : []),
+  ...(whatsappOtpEnabled() ? ['whatsapp'] : []),
+];
 
 const SESSION_SECRET = (() => {
   const fromEnv = env('SESSION_SECRET');
@@ -677,13 +897,107 @@ function readSession(req) {
 /** +9647XXXXXXXXX -> 9647XXXXXXXXX (MSG91 format: country code, no +) */
 const msg91Mobile = (phone) => phone.replace(/^\+/, '');
 
-async function msg91(method, pathQs) {
+async function msg91(method, pathQs, body) {
   const res = await fetch(`${CFG.otp.host}${pathQs}`, {
     method,
     headers: { authkey: CFG.otp.authkey, accept: 'application/json', 'content-type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
   const json = await res.json().catch(() => ({}));
   return json;
+}
+
+const otpHash = (phone, code) => crypto.createHmac('sha256', SESSION_SECRET).update(`${phone}|${code}`).digest('hex');
+
+/** Sends our own code through an approved MSG91 WhatsApp authentication template. */
+async function sendWhatsappOtp(phone) {
+  const code = String(crypto.randomInt(10 ** (CFG.otp.length - 1), 10 ** CFG.otp.length));
+  const components = { body_1: { type: 'text', value: code } };
+  if (CFG.otp.waButton) components.button_1 = { subtype: 'url', type: 'text', value: code };
+  const r = await msg91('POST', '/api/v5/whatsapp/whatsapp-outbound-message/bulk/', {
+    integrated_number: CFG.otp.waNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: CFG.otp.waTemplate,
+        language: { code: CFG.otp.waLang, policy: 'deterministic' },
+        ...(CFG.otp.waNamespace ? { namespace: CFG.otp.waNamespace } : {}),
+        to_and_components: [{ to: [msg91Mobile(phone)], components }],
+      },
+    },
+  });
+  const ok = r && (r.status === 'success' || r.type === 'success' || r.hasError === false);
+  if (!ok) {
+    log('msg91 whatsapp send failed', JSON.stringify(r).slice(0, 300));
+    throw new AppError(502, 'تعذّر إرسال الرمز عبر واتساب، جرّب الرسائل النصية');
+  }
+  state.waOtp = state.waOtp || {};
+  state.waOtp[phone] = { h: otpHash(phone, code), exp: Date.now() + CFG.otp.expiryMin * 60e3 };
+  saveState();
+}
+
+// ---- WhatsApp marketing consent -> Shopify customer
+const CUSTOMER_BY_PHONE = `
+query CustomerByPhone($q: String!) { customers(first: 1, query: $q) { nodes { id tags } } }`;
+const CUSTOMER_CREATE = `
+mutation CustomerCreate($input: CustomerInput!) {
+  customerCreate(input: $input) { customer { id } userErrors { field message } }
+}`;
+const TAGS_ADD = `
+mutation TagsAdd($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`;
+const TAGS_REMOVE = `
+mutation TagsRemove($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`;
+const WA_CONSENT = `
+mutation WaConsent($input: CustomerWhatsAppMarketingConsentUpdateInput!) {
+  customerWhatsAppMarketingConsentUpdate(input: $input) { userErrors { field message } }
+}`;
+const WA_TAG = 'موافق عروض واتساب';
+
+function recordConsent(phone, agreed) {
+  if (typeof agreed !== 'boolean') return;
+  state.consent = state.consent || {};
+  const prev = state.consent[phone];
+  if (prev && prev.wa === agreed && prev.synced) return;
+  state.consent[phone] = { wa: agreed, at: new Date().toISOString(), synced: null };
+  saveState();
+}
+
+/** Pushes the saved consent to Shopify. Never throws (login/orders must not fail). */
+async function syncConsent(phone, customerId = null) {
+  const c = state.consent?.[phone];
+  if (!c || (c.synced && (!customerId || c.synced === customerId))) return;
+  try {
+    let id = customerId;
+    if (!id) {
+      const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
+      id = found.customers?.nodes?.[0]?.id || null;
+    }
+    if (!id && c.wa) {
+      const made = await admin(CUSTOMER_CREATE, { input: { phone, tags: ['تطبيق جي فاير', WA_TAG] } });
+      id = made.customerCreate?.customer?.id || null;
+      if (!id) log('consent customerCreate', JSON.stringify(made.customerCreate?.userErrors).slice(0, 300));
+    }
+    if (!id) return; // no customer yet: synced with the first order
+    await admin(c.wa ? TAGS_ADD : TAGS_REMOVE, { id, tags: [WA_TAG] });
+    const r = await admin(WA_CONSENT, {
+      input: {
+        customerId: id,
+        whatsAppMarketingConsent: {
+          state: c.wa ? 'SUBSCRIBED' : 'UNSUBSCRIBED',
+          optInLevel: 'SINGLE_OPT_IN',
+          updatedAt: c.at,
+        },
+      },
+    });
+    const errs = r.customerWhatsAppMarketingConsentUpdate?.userErrors || [];
+    if (errs.length) log('whatsapp consent userErrors', JSON.stringify(errs).slice(0, 300));
+    c.synced = id;
+    saveState();
+  } catch (e) {
+    log('consent sync failed', String(e.message || e).slice(0, 300));
+  }
 }
 
 async function handleOtpSend(body, ip) {
@@ -693,6 +1007,20 @@ async function handleOtpSend(body, ip) {
   rateLimit(ip, 'otp-send-ip', Number(env('OTP_SENDS_PER_IP_10MIN', '10')), 10 * 60e3);
   rateLimit(phone, 'otp-send', 3, 10 * 60e3);
   if (CFG.otp.testPhone && normalizePhone(CFG.otp.testPhone) === phone) return { ok: true };
+
+  const channels = otpChannels();
+  const channel = body?.channel === 'whatsapp' ? 'whatsapp' : 'sms';
+  if (!channels.includes(channel)) {
+    throw new AppError(400, channel === 'whatsapp' ? 'الإرسال عبر واتساب غير متاح حالياً' : 'الرسائل النصية غير متاحة حالياً');
+  }
+  if (channel === 'whatsapp') {
+    await sendWhatsappOtp(phone);
+    return { ok: true, channel };
+  }
+  if (state.waOtp?.[phone]) {
+    delete state.waOtp[phone];
+    saveState();
+  }
 
   const retry = body?.resend === true;
   const q = new URLSearchParams({ mobile: msg91Mobile(phone) });
@@ -726,6 +1054,19 @@ async function handleOtpVerify(body, ip) {
   let ok;
   if (CFG.otp.testPhone && normalizePhone(CFG.otp.testPhone) === phone) {
     ok = code === CFG.otp.testCode;
+  } else if (state.waOtp?.[phone]) {
+    const w = state.waOtp[phone];
+    if (w.exp < Date.now()) {
+      delete state.waOtp[phone];
+      saveState();
+      throw new AppError(400, 'انتهت صلاحية الرمز، اطلب رمزاً جديداً');
+    }
+    const a = Buffer.from(otpHash(phone, code));
+    ok = crypto.timingSafeEqual(a, Buffer.from(w.h));
+    if (ok) {
+      delete state.waOtp[phone];
+      saveState();
+    }
   } else {
     const q = new URLSearchParams({ otp: code, mobile: msg91Mobile(phone) });
     const r = await msg91('GET', `/api/v5/otp/verify?${q}`);
@@ -736,6 +1077,10 @@ async function handleOtpVerify(body, ip) {
     }
   }
   if (!ok) throw new AppError(400, 'رمز التحقق غير صحيح');
+  if (typeof body?.whatsappConsent === 'boolean') {
+    recordConsent(phone, body.whatsappConsent);
+    syncConsent(phone); // in the background
+  }
   return { token: signSession(phone), phone, expiresInDays: CFG.otp.sessionDays };
 }
 
@@ -815,9 +1160,8 @@ async function aqsatiStart(body, ip, sessionPhone) {
   const order = validateOrder({ ...body, payment: 'aqsati' }, { allowAqsati: true });
   if (sessionPhone) order.customer.phone = sessionPhone;
   rateLimit(ip, 'aqsati-start', 10, 10 * 60e3);
-  const priced = await priceCart(order.lines);
-  const fee = deliveryFee(order, priced.subtotal);
-  const amount = priced.subtotal + fee;
+  const priced = await priceOrder(order);
+  const { fee, total: amount } = orderTotals(order, priced);
   const ref = 'AQ' + crypto.randomBytes(12).toString('base64url');
   state.pending[ref] = { kind: 'aqsati', at: Date.now(), order, priced, amount, stage: 'identity', tries: 0 };
   saveState();
@@ -949,7 +1293,10 @@ function validateOrder(body, opts = {}) {
   if (delivery === 'pickup' && !CFG.pickup.enabled) throw new AppError(400, 'الاستلام من المتجر غير متاح حالياً');
 
   let address = null;
-  if (delivery === 'shipping') {
+  if (delivery === 'shipping' && opts.skipAddress) {
+    const city = WASEET_CITY.get(Number(o.address?.cityId));
+    if (city) address = { governorate: city.name, area: '', cityId: Number(o.address.cityId), regionId: 0, street: '', landmark: '' };
+  } else if (delivery === 'shipping') {
     // Governorate and region must come from the Al-Waseet list.
     const cityId = Number(o.address?.cityId);
     const regionId = Number(o.address?.regionId);
@@ -969,7 +1316,9 @@ function validateOrder(body, opts = {}) {
 
   const payment = ['cod', 'card', 'aqsati'].includes(o.payment) ? o.payment : null;
   if (!payment) throw new AppError(400, 'اختر طريقة الدفع');
-  if (payment === 'cod' && !CFG.cod) throw new AppError(400, 'الدفع عند الاستلام غير متاح');
+  if (opts.skipPayment) {
+    // Discount check only: payment is chosen later.
+  } else if (payment === 'cod' && !CFG.cod) throw new AppError(400, 'الدفع عند الاستلام غير متاح');
   if (payment === 'card' && !hyperpayEnabled()) throw new AppError(400, 'الدفع بالبطاقة غير متاح حالياً');
   if (payment === 'aqsati' && (!aqsatiEnabled() || !opts.allowAqsati)) {
     throw new AppError(400, 'أقساطي غير متاح حالياً');
@@ -985,6 +1334,7 @@ function validateOrder(body, opts = {}) {
     address,
     payment,
     note: str(o.note, 500),
+    discountCode: cleanCode(o.discountCode),
     marketing: o.marketing === true,
     idempotencyKey,
   };
@@ -1011,9 +1361,10 @@ setInterval(() => {
 async function handleConfig() {
   return {
     currency: 'IQD',
-    auth: { otpRequired: otpEnabled(), channel: 'sms' },
+    auth: { otpRequired: otpEnabled(), channel: otpChannels()[0] || 'sms', channels: otpChannels() },
     governorates: WASEET.map((c) => c.name),
     waseet: true,
+    discounts: true,
     delivery: {
       defaultFee: CFG.defaultDeliveryFee,
       fees: CFG.deliveryFees,
@@ -1049,9 +1400,8 @@ async function handleOrder(body, ip, sessionPhone) {
   rateLimit(ip, 'order', CFG.ordersPerIp, 10 * 60e3);
   rateLimit(order.customer.phone, 'order-phone', 4, 10 * 60e3);
 
-  const priced = await priceCart(order.lines);
-  const fee = deliveryFee(order, priced.subtotal);
-  const total = priced.subtotal + fee;
+  const priced = await priceOrder(order);
+  const { fee, discount, total } = orderTotals(order, priced);
 
   let result;
   if (order.payment === 'card') {
@@ -1072,6 +1422,7 @@ async function handleOrder(body, ip, sessionPhone) {
       status: 'payment_required',
       paymentUrl: `${CFG.publicUrl}/pay/${token}`,
       total,
+      discount,
       deliveryFee: fee,
       currency: priced.currency,
     };
@@ -1083,6 +1434,7 @@ async function handleOrder(body, ip, sessionPhone) {
       ...(redirectUrl ? { redirectUrl } : {}),
       orderName: created.orderName,
       total: created.total,
+      discount: created.discount,
       deliveryFee: created.deliveryFee,
       currency: created.currency,
       message:
@@ -1191,6 +1543,10 @@ async function handlePayResult(token) {
 const EDITABLE = [
   ['MSG91_AUTHKEY', 'MSG91 Authkey', true],
   ['MSG91_TEMPLATE_ID', 'MSG91 OTP Template ID', false],
+  ['MSG91_WA_NUMBER', 'رقم واتساب المربوط في MSG91', false],
+  ['MSG91_WA_TEMPLATE', 'اسم قالب واتساب للرمز (Authentication)', false],
+  ['MSG91_WA_NAMESPACE', 'Namespace قالب واتساب', false],
+  ['MSG91_WA_LANG', 'لغة القالب (ar أو en)', false],
   ['OTP_TEST_PHONE', 'رقم تجربة (اختياري)', false],
   ['OTP_TEST_CODE', 'رمز تجربة (اختياري)', true],
   ['HYPERPAY_HOST', 'HyperPay Host', false],
@@ -1238,7 +1594,8 @@ button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;fo
 .st{background:#141417;border:1px solid #2A2A30;border-radius:14px;padding:12px;line-height:1.9}</style></head>
 <body><div class="w"><h1>إعدادات خادم جي فاير</h1>
 <div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
-تسجيل الدخول برمز SMS: <b>${otpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+تسجيل الدخول برمز SMS: <b>${otpChannels().includes('sms') ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
+رمز الدخول عبر واتساب: <b>${whatsappOtpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(aqsatiDemo() ? '(وضع تجربة)' : (() => { try { return new URL(CFG.aqsati.apiBase).host; } catch { return ''; } })())}</span><br>
 عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
 ${msg ? `<div class="m">${escapeHtml(msg)}</div>` : ''}
@@ -1351,6 +1708,18 @@ const server = http.createServer(async (req, res) => {
         throw new AppError(400, 'طلب غير صالح');
       }
       return send(res, 200, await handleAddonQuote(body));
+    }
+
+    if (req.method === 'POST' && p === '/api/discount/check') {
+      checkAppKey(req);
+      rateLimit(clientIp(req), 'discount', 20, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, await handleDiscountCheck(body, readSession(req)));
     }
 
     if (req.method === 'POST' && p.startsWith('/api/aqsati/')) {
