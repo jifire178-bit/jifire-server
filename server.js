@@ -1322,7 +1322,7 @@ const LOY = CFG.loyalty;
 const LEDGER_GET = `
 query Ledger($id: ID!) {
   customer(id: $id) {
-    id numberOfOrders
+    id numberOfOrders createdAt
     metafield(namespace: "jifire_loyalty", key: "ledger") { value }
   }
 }`;
@@ -1368,7 +1368,7 @@ async function loadLedger(customerId) {
     ledger = {};
   }
   if (!Array.isArray(ledger.entries)) ledger.entries = [];
-  return { ledger, orders: Number(d.customer.numberOfOrders || 0) };
+  return { ledger, orders: Number(d.customer.numberOfOrders || 0), createdAt: d.customer.createdAt || null };
 }
 
 async function saveLedger(customerId, ledger) {
@@ -1420,6 +1420,12 @@ function customerFromCode(code) {
   for (const ch of m[1]) n = n * 36n + BigInt(parseInt(ch, 36));
   return `gid://shopify/Customer/${n}`;
 }
+
+// Invite codes are only for brand-new accounts (no orders, created recently).
+const REFERRAL_NEW_DAYS = 30;
+const isNewAccount = (orders, createdAt) =>
+  Number(orders || 0) === 0 &&
+  (!createdAt || Date.now() - Date.parse(createdAt) < REFERRAL_NEW_DAYS * 86400e3);
 
 const orderAttr = (o, key) => (o.customAttributes || []).find((a) => a.key === key)?.value;
 
@@ -1562,6 +1568,8 @@ async function handleLoyaltyMe(phone) {
   const recent = await admin(MY_ORDERS_QUERY, { q: `customer_id:${id}` });
   const orders = recent.orders?.nodes || [];
   const ledger = (await reconcileCustomer(c.id, orders)) || { entries: [] };
+  const acct = await admin(LEDGER_GET, { id: c.id }).catch(() => null);
+  const fresh = isNewAccount(acct?.customer?.numberOfOrders ?? c.numberOfOrders, acct?.customer?.createdAt);
   const pending = orders.reduce((a, o) => a + orderPointsTarget(o).pending, 0);
   const balance = ledgerBalance(ledger);
   const label = { earn: 'طلب مكتمل', redeem: 'استبدال نقاط', welcome: 'هدية الانضمام بدعوة', referral: 'دعوة صديق' };
@@ -1573,7 +1581,7 @@ async function handleLoyaltyMe(phone) {
     code: referralCode(c.id),
     referral: {
       applied: Boolean(ledger.ref?.by),
-      canApply: !ledger.ref?.by && Number(c.numberOfOrders || 0) === 0,
+      canApply: !ledger.ref?.by && fresh,
       friends: ledger.entries.filter((e) => e.k.startsWith('ref:') && e.p > 0).length,
     },
     history: ledger.entries
@@ -1599,9 +1607,14 @@ async function handleReferral(phone, body) {
   const ref = await admin(LEDGER_GET, { id: referrer });
   if (!ref.customer) throw new AppError(400, 'كود الدعوة غير صحيح');
   return withLoyaltyLock(c.id, async () => {
-    const { ledger, orders } = await loadLedger(c.id);
+    const { ledger, orders, createdAt } = await loadLedger(c.id);
     if (ledger.ref?.by) throw new AppError(400, 'سبق أن أضفت كود دعوة');
-    if (orders > 0) throw new AppError(400, 'كود الدعوة للزبائن الجدد قبل أول طلب فقط');
+    if (!isNewAccount(orders, createdAt)) throw new AppError(400, 'كود الدعوة للحسابات الجديدة فقط قبل أول طلب');
+    // The inviter's account must be older than the invited one.
+    const refAt = Date.parse(ref.customer.createdAt || '');
+    if (createdAt && refAt && refAt >= Date.parse(createdAt)) {
+      throw new AppError(400, 'كود الدعوة يجب أن يكون من حساب أقدم من حسابك');
+    }
     ledger.ref = { by: referrer, at: new Date().toISOString() };
     await saveLedger(c.id, ledger);
     return { ok: true, friendPoints: LOY.friend };
