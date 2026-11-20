@@ -581,6 +581,66 @@ async function handleDiscountCheck(body, sessionPhone) {
   return { code: d.code, title: d.title, amount: d.amount, freeShipping: d.freeShipping };
 }
 
+// --------------------------------------------------------- app banners ---
+// Managed in Shopify admin: Content → Metaobjects → "بنرات التطبيق".
+
+const BANNERS_QUERY = `
+query Banners {
+  metaobjects(type: "app_banner", first: 30) {
+    nodes {
+      id
+      capabilities { publishable { status } }
+      fields {
+        key value
+        reference {
+          __typename
+          ... on MediaImage { image { url width height } }
+          ... on Collection { handle title }
+          ... on Product { handle title }
+        }
+      }
+    }
+  }
+}`;
+let bannersCache = { at: 0, data: null };
+
+async function handleBanners() {
+  if (bannersCache.data && Date.now() - bannersCache.at < 60e3) return bannersCache.data;
+  let nodes = [];
+  try {
+    nodes = (await admin(BANNERS_QUERY, {})).metaobjects?.nodes || [];
+  } catch (e) {
+    log('banners failed', String(e.message || e).slice(0, 300));
+    if (bannersCache.data) return bannersCache.data;
+    return { banners: [] };
+  }
+  const now = Date.now();
+  const banners = [];
+  for (const n of nodes) {
+    if (n.capabilities?.publishable?.status && n.capabilities.publishable.status !== 'ACTIVE') continue;
+    const f = Object.fromEntries(n.fields.map((x) => [x.key, x]));
+    const img = f.image?.reference?.image;
+    if (!img?.url) continue;
+    const t = (k) => (f[k]?.value ? Date.parse(f[k].value) : NaN);
+    if (t('starts_at') > now || t('ends_at') < now) continue;
+    let link = null;
+    if (f.product?.reference?.handle) link = { type: 'product', handle: f.product.reference.handle, title: f.product.reference.title };
+    else if (f.collection?.reference?.handle) link = { type: 'collection', handle: f.collection.reference.handle, title: f.collection.reference.title };
+    else if (/^https?:\/\//.test(f.url?.value || '')) link = { type: 'url', url: f.url.value };
+    banners.push({
+      id: n.id,
+      title: f.title?.value || '',
+      image: img.url,
+      aspect: img.width && img.height ? img.width / img.height : 2,
+      link,
+      sort: Number(f.sort?.value || 0),
+    });
+  }
+  banners.sort((a, b) => a.sort - b.sort);
+  bannersCache = { at: Date.now(), data: { banners } };
+  return bannersCache.data;
+}
+
 const PAYMENT_LABEL = {
   cod: 'الدفع عند الاستلام',
   card: 'بطاقة (HyperPay)',
@@ -1861,6 +1921,11 @@ const server = http.createServer(async (req, res) => {
         log('me profile lookup failed', String(e.message || e).slice(0, 200));
       }
       return send(res, 200, { phone, whatsappConsent: state.consent?.[phone]?.wa === true, profile });
+    }
+
+    if (req.method === 'GET' && p === '/api/banners') {
+      checkAppKey(req);
+      return send(res, 200, await handleBanners());
     }
 
     if (req.method === 'POST' && p === '/api/auth/profile') {
