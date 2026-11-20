@@ -1292,7 +1292,7 @@ async function checkFulfilledOrders() {
         if (item) {
           state.reviewAsks = state.reviewAsks || {};
           state.reviewAsks[o.id] = {
-            due: Date.now() + Number(env('REVIEW_ASK_HOURS', '24')) * 3600e3,
+            due: Date.now() + Number(env('REVIEW_ASK_HOURS', '0')) * 3600e3,
             phones: [...phones],
             handle: item.product.handle,
             title: item.product.title,
@@ -1315,6 +1315,7 @@ async function checkFulfilledOrders() {
       }
     }
     op.since = newest;
+    checkReviewAsks().catch(() => {}); // "قيّم منتجك" right after delivery
     const cutoff = Date.now() - 30 * 86400e3;
     for (const [id, at] of Object.entries(op.done)) if (at < cutoff) delete op.done[id];
     saveState();
@@ -3002,7 +3003,7 @@ const EDITABLE = [
   ['LOYALTY_REFERRER_POINTS', 'النقاط: مكافأة صاحب الدعوة', false],
   ['LOYALTY_FRIEND_POINTS', 'النقاط: هدية الصديق المدعو', false],
   ['LOYALTY_REFERRAL_MONTHLY_CAP', 'النقاط: أقصى عدد دعوات مكافأة بالشهر للشخص', false],
-  ['REVIEW_ASK_HOURS', 'إشعار «قيّم منتجك»: بعد كم ساعة من التسليم', false],
+  ['REVIEW_ASK_HOURS', 'إشعار «قيّم منتجك»: بعد كم ساعة من التسليم (0 = مباشرة)', false],
   ['MSG_DELIVERED_TITLE', 'إشعار تسليم الطلب: العنوان ({order} = رقم الطلب)', false],
   ['MSG_DELIVERED_BODY', 'إشعار تسليم الطلب: النص ({order} = رقم الطلب)', false],
   ['MSG_CANCELLED_TITLE', 'إشعار إلغاء الطلب: العنوان ({order} = رقم الطلب)', false],
@@ -3348,7 +3349,7 @@ function adminDefaults() {
     MSG_CANCELLED_TITLE: t.cancelledTitle,
     MSG_CANCELLED_BODY: t.cancelledBody,
     LOYALTY_ENABLED: String(LOY.enabled),
-    REVIEW_ASK_HOURS: env('REVIEW_ASK_HOURS', '24'),
+    REVIEW_ASK_HOURS: env('REVIEW_ASK_HOURS', '0'),
     APP_FORCE_LATEST: String(CFG.app.forceLatest),
     PICKUP_ENABLED: String(bool('PICKUP_ENABLED', true)),
     COD_ENABLED: String(bool('COD_ENABLED', true)),
