@@ -679,6 +679,51 @@ query Catalog($after: String) {
 }`;
 let catalogCache = { at: 0, items: [], loading: null };
 
+// ---- Support links ("الدعم والتواصل"): read live from the store's own site
+// (Shopify theme → social links), cached for an hour, with safe fallbacks.
+const SOCIAL_FALLBACK = {
+  whatsapp: 'https://wa.me/9647733330769',
+  facebook: 'https://www.facebook.com/share/1Byg4qsAic/',
+  instagram: 'https://www.instagram.com/jifirephone',
+  tiktok: 'https://www.tiktok.com/@jifire',
+};
+let socialCache = { at: 0, links: null };
+
+function parseSocialLinks(html) {
+  const out = {};
+  const hrefs = String(html).match(/href\s*=\s*"[^"]+"/gi) || [];
+  const pick = (key, re) => {
+    if (out[key]) return;
+    for (const h of hrefs) {
+      const u = h.replace(/^href\s*=\s*"/i, '').replace(/"$/, '').replace(/&amp;/g, '&');
+      if (/^https?:\/\//i.test(u) && re.test(u) && !/sharer|share\.php|intent\/tweet|pin\/create/i.test(u)) {
+        out[key] = u;
+        return;
+      }
+    }
+  };
+  pick('whatsapp', /(?:wa\.me|api\.whatsapp\.com|whatsapp\.com\/)/i);
+  pick('facebook', /(?:facebook\.com|fb\.com|fb\.me)/i);
+  pick('instagram', /instagram\.com/i);
+  pick('tiktok', /tiktok\.com/i);
+  return out;
+}
+
+async function handleSupport() {
+  if (socialCache.links && Date.now() - socialCache.at < 60 * 60e3) return { links: socialCache.links };
+  let found = {};
+  try {
+    const site = process.env.STORE_SITE_URL || CFG.siteBase || `https://${CFG.shop}`;
+    const res = await fetch(site, { redirect: 'follow', signal: AbortSignal.timeout(8000) });
+    if (res.ok) found = parseSocialLinks(await res.text());
+  } catch (e) {
+    console.warn('support links:', e.message);
+  }
+  const links = { ...SOCIAL_FALLBACK, ...(socialCache.links || {}), ...found };
+  socialCache = { at: Date.now(), links };
+  return { links };
+}
+
 async function storefront(query, variables) {
   const base = CFG.adminBase || `https://${CFG.shop}`;
   const res = await fetch(`${base}/api/2026-07/graphql.json`, {
@@ -2617,6 +2662,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await handleNotices());
     }
 
+    if (req.method === 'GET' && p === '/api/support') {
+      checkAppKey(req);
+      return send(res, 200, await handleSupport());
+    }
+
     if (req.method === 'GET' && p === '/api/banners') {
       checkAppKey(req);
       return send(res, 200, await handleBanners());
@@ -2745,4 +2795,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession };
+module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks };
