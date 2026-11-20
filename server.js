@@ -237,7 +237,7 @@ query Variants($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProductVariant {
       id title sku price availableForSale
-      product { title status }
+      product { title status productType }
     }
   }
 }`;
@@ -249,6 +249,80 @@ mutation OrderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOption
     userErrors { field message }
   }
 }`;
+
+// ------------------------------------------------------------- add-ons ---
+// Cover / screen-protector services offered with phones and tablets.
+// Prices are decided here, never by the app.
+
+const ADDON_TYPES = env('ADDON_PRODUCT_TYPES', 'هواتف ذكية,هواتف,موبايلات,تابلت,أجهزة لوحية,ايباد,آيباد')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+
+// [title pattern | min price, cover, protector] — first match wins.
+const ADDON_RULES = [
+  { match: /(1[78])\s*pro\s*max|(1[78])\s*برو\s*ماكس/i, cover: 10000, protector: 10000 },
+  { match: /s\s*26\s*ultra|s\s*26\s*(ألترا|الترا)/i, cover: 10000, protector: 10000 },
+  { min: 600000, cover: 5000, protector: 5000 },
+  { min: 150000, cover: 4000, protector: 3000 },
+];
+
+function addonPrices(item) {
+  if (!ADDON_TYPES.includes(String(item.productType || '').trim())) return null;
+  for (const r of ADDON_RULES) {
+    if (r.match ? r.match.test(item.title) : item.price >= r.min) {
+      return { cover: r.cover, protector: r.protector };
+    }
+  }
+  return null;
+}
+
+const ADDON_QUERY = `
+query Addons { products(first: 50, query: "tag:'JiFire Cart Addon'") {
+  nodes { handle title status variants(first: 1) { nodes { id price } } } } }`;
+let addonCache = { at: 0, map: null };
+
+/** {cover: {price: {variantId, title}}, protector: {...}} from Shopify service products. */
+async function addonProducts() {
+  if (addonCache.map && Date.now() - addonCache.at < 10 * 60e3) return addonCache.map;
+  const map = { cover: {}, protector: {} };
+  try {
+    const data = await admin(ADDON_QUERY);
+    for (const p of data.products.nodes) {
+      if (p.status !== 'ACTIVE') continue;
+      const v = p.variants.nodes[0];
+      if (!v) continue;
+      const kind = /protector|لاصق/i.test(p.handle + p.title) ? 'protector' : /case|كفر/i.test(p.handle + p.title) ? 'cover' : null;
+      if (!kind) continue;
+      const price = Math.round(Number(v.price));
+      if (!map[kind][price]) map[kind][price] = { variantId: v.id, title: p.title };
+    }
+  } catch (e) {
+    log('addon products lookup failed', e.message);
+  }
+  addonCache = { at: Date.now(), map };
+  return map;
+}
+
+const ADDON_TITLE = {
+  cover: (p) => `خدمة كفر حماية - ${p} دينار`,
+  protector: (p) => `خدمة لاصق شاشة مع التركيب - ${p} دينار`,
+};
+
+/** Which add-ons each cart line can have, with prices. */
+async function handleAddonQuote(body) {
+  const lines = (Array.isArray(body?.lines) ? body.lines : [])
+    .filter((l) => /^gid:\/\/shopify\/ProductVariant\/\d+$/.test(String(l?.variantId)))
+    .slice(0, 30)
+    .map((l) => ({ variantId: l.variantId, quantity: 1 }));
+  if (!lines.length) return { lines: [] };
+  const ids = [...new Set(lines.map((l) => l.variantId))];
+  const data = await admin(VARIANTS_QUERY, { ids });
+  return {
+    lines: (data.nodes || []).filter(Boolean).map((v) => {
+      const prices = addonPrices({ title: v.product?.title || '', price: Number(v.price), productType: v.product?.productType });
+      return { variantId: v.id, ...(prices ? { cover: prices.cover, protector: prices.protector } : {}) };
+    }),
+  };
+}
 
 /** Re-prices the cart from Shopify. Never trusts prices sent by the app. */
 async function priceCart(lines) {
@@ -271,8 +345,36 @@ async function priceCart(lines) {
       title: v.product.title,
       variantTitle: v.title === 'Default Title' ? '' : v.title,
       price: Number(v.price),
+      productType: v.product.productType,
+      addons: l.addons,
     });
   }
+  // Cover / protector services chosen for phones and tablets.
+  const services = [];
+  if (items.some((i) => i.addons && (i.addons.cover || i.addons.protector))) {
+    const products = await addonProducts();
+    for (const i of items) {
+      if (!i.addons) continue;
+      const prices = addonPrices(i);
+      if (!prices) continue;
+      for (const kind of ['cover', 'protector']) {
+        if (!i.addons[kind]) continue;
+        const price = prices[kind];
+        const sp = products[kind][price];
+        const props = [{ name: 'للجهاز', value: i.title + (i.variantTitle ? ` (${i.variantTitle})` : '') }];
+        if (kind === 'cover' && i.addons.note) props.push({ name: 'ملاحظة الكفر', value: i.addons.note });
+        services.push({
+          variantId: sp?.variantId || null,
+          title: sp?.title || ADDON_TITLE[kind](price),
+          quantity: i.quantity,
+          price,
+          service: kind,
+          properties: props,
+        });
+      }
+    }
+  }
+  items.push(...services);
   const subtotal = items.reduce((s, i) => s + i.price * i.quantity, 0);
   return { items, subtotal, currency };
 }
@@ -351,11 +453,12 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   const input = {
     currency: priced.currency,
     lineItems: priced.items.map((i) => ({
-      variantId: i.variantId,
+      ...(i.variantId ? { variantId: i.variantId } : { title: i.title }),
       quantity: i.quantity,
       priceSet: money(i.price),
       // Without this Shopify marks app orders "Shipping not required".
       requiresShipping: !pickup,
+      ...(i.properties ? { properties: i.properties } : {}),
     })),
     phone: order.customer.phone,
     email: order.customer.email || null,
@@ -829,7 +932,11 @@ function validateOrder(body, opts = {}) {
     if (!/^gid:\/\/shopify\/ProductVariant\/\d+$/.test(String(l.variantId)) || !Number.isInteger(q) || q < 1 || q > 20) {
       throw new AppError(400, 'بيانات السلة غير صحيحة');
     }
-    return { variantId: l.variantId, quantity: q };
+    const a = l.addons && typeof l.addons === 'object' ? l.addons : null;
+    const addons = a && (a.cover === true || a.protector === true)
+      ? { cover: a.cover === true, protector: a.protector === true, note: a.cover === true ? str(a.note, 100) : '' }
+      : null;
+    return { variantId: l.variantId, quantity: q, ...(addons ? { addons } : {}) };
   });
   const name = str(o.customer?.name, 80);
   if (name.length < 3) throw new AppError(400, 'اكتب الاسم الكامل');
@@ -1233,6 +1340,17 @@ const server = http.createServer(async (req, res) => {
       }
       const fn = p.endsWith('/send') ? handleOtpSend : handleOtpVerify;
       return send(res, 200, await fn(body, clientIp(req)));
+    }
+
+    if (req.method === 'POST' && p === '/api/addons/quote') {
+      checkAppKey(req);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      return send(res, 200, await handleAddonQuote(body));
     }
 
     if (req.method === 'POST' && p.startsWith('/api/aqsati/')) {
