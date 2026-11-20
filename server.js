@@ -966,6 +966,230 @@ async function handleAiAsk(body, ip) {
   return { mode: 'search', answer: AI_FALLBACK_TEXT[lang](top.length), products: top.map(productCardJson) };
 }
 
+// ---------------------------------------------------- app notifications ---
+// Managed in Shopify admin: Content → Metaobjects → "إشعارات التطبيق".
+// The app syncs this list: new → notification, edited → updated, deleted → removed.
+
+const NOTICES_QUERY = `
+query Notices {
+  metaobjects(type: "app_notification", first: 50, sortKey: "updated_at", reverse: true) {
+    nodes {
+      id updatedAt
+      capabilities { publishable { status } }
+      fields {
+        key value
+        reference {
+          __typename
+          ... on MediaImage { image { url } }
+          ... on Collection { handle title }
+          ... on Product { handle title }
+        }
+      }
+    }
+  }
+}`;
+let noticesCache = { at: 0, data: null };
+
+async function handleNotices() {
+  if (noticesCache.data && Date.now() - noticesCache.at < 60e3) return noticesCache.data;
+  let nodes;
+  try {
+    nodes = (await admin(NOTICES_QUERY, {})).metaobjects?.nodes || [];
+  } catch (e) {
+    log('notices failed', String(e.message || e).slice(0, 300));
+    if (noticesCache.data) return noticesCache.data;
+    throw new AppError(503, 'تعذّر تحميل الإشعارات');
+  }
+  const now = Date.now();
+  const notices = [];
+  for (const n of nodes) {
+    if (n.capabilities?.publishable?.status && n.capabilities.publishable.status !== 'ACTIVE') continue;
+    const f = Object.fromEntries(n.fields.map((x) => [x.key, x]));
+    const title = String(f.title?.value || '').trim();
+    if (!title) continue;
+    const sendAt = f.send_at?.value ? Date.parse(f.send_at.value) : NaN;
+    const expires = f.expires_at?.value ? Date.parse(f.expires_at.value) : NaN;
+    if (sendAt > now || expires < now) continue;
+    let link = null;
+    if (f.product?.reference?.handle) link = { type: 'product', handle: f.product.reference.handle };
+    else if (f.collection?.reference?.handle) link = { type: 'collection', handle: f.collection.reference.handle, title: f.collection.reference.title };
+    else if (/^https?:\/\//.test(f.url?.value || '')) link = { type: 'url', url: f.url.value };
+    notices.push({
+      id: n.id,
+      title,
+      body: String(f.body?.value || '').trim(),
+      image: f.image?.reference?.image?.url || null,
+      link,
+      at: new Date(Number.isNaN(sendAt) ? Date.parse(n.updatedAt) : sendAt).toISOString(),
+      updatedAt: n.updatedAt,
+    });
+  }
+  noticesCache = { at: Date.now(), data: { notices } };
+  return noticesCache.data;
+}
+
+
+// ------------------------------------------------- order status pushes ---
+// When an order is marked Fulfilled in Shopify, the customer's phone gets
+// "طلبك في طريقه إليك" through Firebase Cloud Messaging (HTTP v1).
+// The app registers its push token for the logged-in phone.
+
+function serviceAccount() {
+  const raw = env('FIREBASE_SERVICE_ACCOUNT');
+  if (!raw) return null;
+  try {
+    const txt = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const j = JSON.parse(txt);
+    if (j.client_email && j.private_key && j.project_id) return j;
+  } catch {}
+  return null;
+}
+const pushEnabled = () => Boolean(serviceAccount());
+let fcmAuth = { token: null, exp: 0 };
+
+async function fcmAccessToken(sa) {
+  if (fcmAuth.token && Date.now() < fcmAuth.exp) return fcmAuth.token;
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const tokenUri = sa.token_uri || 'https://oauth2.googleapis.com/token';
+  const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: tokenUri,
+    iat: now,
+    exp: now + 3600,
+  })}`;
+  const sig = crypto.createSign('RSA-SHA256').update(unsigned).sign(sa.private_key, 'base64url');
+  const res = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: `${unsigned}.${sig}`,
+    }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) throw new Error(`fcm auth ${res.status} ${JSON.stringify(j).slice(0, 200)}`);
+  fcmAuth = { token: j.access_token, exp: Date.now() + (Number(j.expires_in || 3600) - 300) * 1000 };
+  return fcmAuth.token;
+}
+
+/** Returns 'ok', 'invalid' (token gone: forget it) or 'error'. */
+async function sendPush(token, { title, body, data = {} }) {
+  const sa = serviceAccount();
+  if (!sa) return 'error';
+  const base = env('FCM_API_BASE', 'https://fcm.googleapis.com');
+  const res = await fetch(`${base}/v1/projects/${sa.project_id}/messages:send`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${await fcmAccessToken(sa)}` },
+    body: JSON.stringify({
+      message: {
+        token,
+        notification: { title, body },
+        data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+        android: {
+          priority: 'high',
+          notification: { channel_id: 'jifire_store', color: '#E2B85A', icon: 'ic_stat_notify' },
+        },
+      },
+    }),
+  });
+  if (res.ok) return 'ok';
+  const j = await res.json().catch(() => ({}));
+  const code = JSON.stringify(j);
+  if (res.status === 404 || /UNREGISTERED|INVALID_ARGUMENT.*token|registration-token/i.test(code)) return 'invalid';
+  log('push failed', res.status, code.slice(0, 300));
+  return 'error';
+}
+
+function registerPushToken(phone, token, lang) {
+  state.push = state.push || {};
+  for (const [ph, list] of Object.entries(state.push)) {
+    state.push[ph] = list.filter((x) => x.token !== token);
+    if (!state.push[ph].length) delete state.push[ph];
+  }
+  const list = (state.push[phone] = state.push[phone] || []);
+  list.unshift({ token, lang: ['ar', 'en', 'ckb'].includes(lang) ? lang : 'ar', at: Date.now() });
+  state.push[phone] = list.slice(0, 5); // a few devices per customer
+  saveState();
+}
+
+function unregisterPushToken(token) {
+  if (!state.push) return;
+  for (const [ph, list] of Object.entries(state.push)) {
+    state.push[ph] = list.filter((x) => x.token !== token);
+    if (!state.push[ph].length) delete state.push[ph];
+  }
+  saveState();
+}
+
+const SHIPPED_TEXT = {
+  ar: (n) => ({ title: 'طلبك في طريقه إليك 🚚', body: `طلبك ${n} خرج للتوصيل وسيصلك قريباً. شكراً لتسوقك من جي فاير!` }),
+  en: (n) => ({ title: 'Your order is on its way 🚚', body: `Order ${n} is out for delivery and will reach you soon. Thanks for shopping at JiFire!` }),
+  ckb: (n) => ({ title: 'داواکارییەکەت لە ڕێگادایە 🚚', body: `داواکاری ${n} نێردرا بۆ گەیاندن و بەم زووانە دەگات. سوپاس بۆ کڕین لە جی فایەر!` }),
+};
+
+const FULFILLED_QUERY = `
+query Fulfilled($q: String!) {
+  orders(first: 50, sortKey: UPDATED_AT, reverse: true, query: $q) {
+    nodes {
+      id name updatedAt displayFulfillmentStatus phone
+      customer { defaultPhoneNumber { phoneNumber } }
+      shippingAddress { phone }
+    }
+  }
+}`;
+
+let watching = false;
+async function checkFulfilledOrders() {
+  if (watching || !pushEnabled() || !state.push || !Object.keys(state.push).length) return;
+  watching = true;
+  try {
+    state.orderPush = state.orderPush || {};
+    const op = state.orderPush;
+    if (!op.since) {
+      // First run: only orders fulfilled from now on.
+      op.since = new Date().toISOString();
+      op.done = {};
+      saveState();
+      return;
+    }
+    const since = new Date(Date.parse(op.since) - 2 * 60e3).toISOString(); // small overlap
+    const data = await admin(FULFILLED_QUERY, { q: `fulfillment_status:shipped updated_at:>'${since}'` });
+    let newest = op.since;
+    for (const o of data.orders?.nodes || []) {
+      if (o.updatedAt > newest) newest = o.updatedAt;
+      if (!['FULFILLED', 'PARTIALLY_FULFILLED'].includes(o.displayFulfillmentStatus)) continue;
+      if (op.done[o.id] || o.updatedAt < since) continue;
+      op.done[o.id] = Date.now();
+      const phones = new Set(
+        [o.phone, o.customer?.defaultPhoneNumber?.phoneNumber, o.shippingAddress?.phone]
+          .map(normalizePhone)
+          .filter(Boolean)
+      );
+      for (const ph of phones) {
+        for (const dev of [...(state.push[ph] || [])]) {
+          const msg = (SHIPPED_TEXT[dev.lang] || SHIPPED_TEXT.ar)(o.name);
+          const r = await sendPush(dev.token, { ...msg, data: { type: 'order', status: 'shipped', order: o.name } });
+          if (r === 'invalid') unregisterPushToken(dev.token);
+          log('order push', o.name, ph.slice(-4), r);
+        }
+      }
+    }
+    op.since = newest;
+    const cutoff = Date.now() - 30 * 86400e3;
+    for (const [id, at] of Object.entries(op.done)) if (at < cutoff) delete op.done[id];
+    saveState();
+  } catch (e) {
+    log('fulfilled check failed', String(e.message || e).slice(0, 300));
+  } finally {
+    watching = false;
+  }
+}
+if (require.main === module || process.env.ORDER_PUSH_INTERVAL_MS) {
+  setInterval(checkFulfilledOrders, Number(env('ORDER_PUSH_INTERVAL_MS', '90000'))).unref();
+}
+
 const PAYMENT_LABEL = {
   cod: 'الدفع عند الاستلام',
   card: 'بطاقة (HyperPay)',
@@ -2039,6 +2263,7 @@ const EDITABLE = [
   ['OTP_TEST_PHONE', 'رقم تجربة (اختياري)', false],
   ['OTP_TEST_CODE', 'رمز تجربة (اختياري)', true],
   ['AI_API_KEY', 'مفتاح الذكاء الاصطناعي (Gemini API key)', true],
+  ['FIREBASE_SERVICE_ACCOUNT', 'مفتاح خدمة Firebase (ملف JSON) لإشعارات حالة الطلب', true],
   ['AI_MODEL', 'نموذج الذكاء الاصطناعي (اتركه فارغاً للافتراضي)', false],
   ['AI_API_URL', 'رابط API (اتركه فارغاً لـ Gemini)', false],
   ['HYPERPAY_HOST', 'HyperPay Host', false],
@@ -2072,6 +2297,12 @@ function adminPage(msg = '', ok = false) {
   const rows = EDITABLE.map(([k, label, secret]) => {
     const cur = process.env[k] || '';
     const shown = secret ? (cur ? '•••• محفوظ' : '') : cur;
+    if (k === 'FIREBASE_SERVICE_ACCOUNT') {
+      return `<label>${escapeHtml(label)}<small>${escapeHtml(k)}</small>
+<input type="file" accept=".json,application/json" onchange="const f=this.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{document.getElementById('fsa').value=r.result;document.getElementById('fsan').textContent='✅ '+f.name};r.readAsText(f)">
+<span id="fsan" style="font-weight:400;color:#8E8E96">${escapeHtml(shown)}</span>
+<textarea id="fsa" name="${k}" style="display:none"></textarea></label>`;
+    }
     return `<label>${escapeHtml(label)}<small>${escapeHtml(k)}</small>
 <input name="${k}" placeholder="${escapeHtml(shown)}" ${secret ? 'type="password" autocomplete="new-password"' : ''}></label>`;
   }).join('');
@@ -2088,6 +2319,7 @@ button{width:100%;padding:14px;border:0;border-radius:14px;background:#E2B85A;fo
 <div class="st">الدفع بالبطاقة: <b>${hyperpayEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 تسجيل الدخول برمز SMS: <b>${otpChannels().includes('sms') ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 المساعد الذكي: <b>${CFG.ai.key ? 'AI مفعّل ✅ (' + escapeHtml(CFG.ai.model) + ')' : 'بحث ذكي مجاني (بدون مفتاح AI)'}</b><br>
+إشعار "طلبك في طريقه إليك": <b>${pushEnabled() ? 'مفعّل ✅ (' + Object.values(state.push || {}).reduce((n, l) => n + l.length, 0) + ' جهاز)' : 'غير مفعّل (يحتاج مفتاح Firebase)'}</b><br>
 رمز الدخول عبر واتساب: <b>${whatsappOtpEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b><br>
 أقساطي: <b>${aqsatiEnabled() ? 'مفعّل ✅' : 'غير مفعّل'}</b> <span dir="ltr">${escapeHtml(aqsatiDemo() ? '(وضع تجربة)' : (() => { try { return new URL(CFG.aqsati.apiBase).host; } catch { return ''; } })())}</span><br>
 عنوان الخادم: <b dir="ltr">${escapeHtml(CFG.publicUrl)}</b></div>
@@ -2265,6 +2497,32 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await handleAiAsk(body, clientIp(req)));
     }
 
+    if (req.method === 'POST' && (p === '/api/push/register' || p === '/api/push/unregister')) {
+      checkAppKey(req);
+      rateLimit(clientIp(req), 'push', 30, 10 * 60e3);
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        throw new AppError(400, 'طلب غير صالح');
+      }
+      const token = String(body?.token || '').trim();
+      if (token.length < 20 || token.length > 4096) throw new AppError(400, 'طلب غير صالح');
+      if (p === '/api/push/unregister') {
+        unregisterPushToken(token);
+        return send(res, 200, { ok: true });
+      }
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      registerPushToken(phone, token, body?.lang);
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && p === '/api/notifications') {
+      checkAppKey(req);
+      return send(res, 200, await handleNotices());
+    }
+
     if (req.method === 'GET' && p === '/api/banners') {
       checkAppKey(req);
       return send(res, 200, await handleBanners());
@@ -2312,7 +2570,16 @@ const server = http.createServer(async (req, res) => {
       }
       const changes = {};
       for (const [k] of EDITABLE) {
-        const v = (form.get(k) || '').trim();
+        let v = (form.get(k) || '').trim();
+        if (v && k === 'FIREBASE_SERVICE_ACCOUNT' && v !== '-') {
+          try {
+            const j = JSON.parse(v);
+            if (!j.client_email || !j.private_key || !j.project_id) throw new Error('bad');
+            v = Buffer.from(JSON.stringify(j)).toString('base64'); // one safe line in .env
+          } catch {
+            return send(res, 400, adminPage('ملف Firebase غير صحيح: اختر ملف Service account (JSON)'), 'text/html; charset=utf-8');
+          }
+        }
         if (v) changes[k] = v === '-' ? '' : v;
       }
       if (!Object.keys(changes).length) {
