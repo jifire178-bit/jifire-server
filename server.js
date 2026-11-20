@@ -73,10 +73,10 @@ const CFG = {
   cod: bool('COD_ENABLED', true),
   // Customer-facing texts, editable from /admin (Arabic). {order} = order number.
   texts: {
-    success: env('MSG_SUCCESS', 'سنتصل بك لتأكيد الطلب ثم نرسله إليك.'),
-    successPickup: env('MSG_SUCCESS_PICKUP', 'طلبك جاهز للاستلام بعد تأكيده، سنتصل بك.'),
-    receivedTitle: env('MSG_RECEIVED_TITLE', 'تم استلام طلبك ✅'),
-    receivedBody: env('MSG_RECEIVED_BODY', 'شكراً لتسوقك من جي فاير! سنتواصل معك قريباً لتأكيد التوصيل.'),
+    success: env('MSG_SUCCESS', 'سنوافيك بتحديثات طلبك قريباً. شكراً لتسوقك من جي فاير!'),
+    successPickup: env('MSG_SUCCESS_PICKUP', 'سنعلمك عندما يكون طلبك جاهزاً للاستلام. شكراً لتسوقك من جي فاير!'),
+    receivedTitle: env('MSG_RECEIVED_TITLE', 'تم استلام طلبك بنجاح ✅'),
+    receivedBody: env('MSG_RECEIVED_BODY', 'سنوافيك بتحديثات طلبك قريباً. شكراً لتسوقك من جي فاير!'),
     shippedTitle: env('MSG_SHIPPED_TITLE', 'طلبك في طريقه إليك 🚚'),
     shippedBody: env('MSG_SHIPPED_BODY', 'طلبك {order} خرج للتوصيل وسيصلك قريباً. شكراً لتسوقك من جي فاير!'),
   },
@@ -1206,6 +1206,62 @@ async function checkFulfilledOrders() {
 }
 if (require.main === module || process.env.ORDER_PUSH_INTERVAL_MS) {
   setInterval(checkFulfilledOrders, Number(env('ORDER_PUSH_INTERVAL_MS', '90000'))).unref();
+}
+
+// ---------------------------------------------------------- my orders ---
+// "طلباتي" / order tracking in the app: the logged-in phone's Shopify orders
+// with a 4-step status (received → preparing → on the way → delivered).
+
+const MY_ORDERS_QUERY = `
+query MyOrders($q: String!) {
+  orders(first: 20, query: $q, sortKey: CREATED_AT, reverse: true) {
+    nodes {
+      id name createdAt cancelledAt tags displayFulfillmentStatus
+      totalPriceSet { shopMoney { amount } }
+      shippingAddress { city address1 }
+      lineItems(first: 6) { nodes { title quantity image { url } } }
+      fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
+    }
+  }
+}`;
+
+function orderStep(o) {
+  const tags = (o.tags || []).join(' ');
+  const f = o.fulfillments || [];
+  if (o.cancelledAt || /إلغاء|ملغي|cancel/i.test(tags)) return { step: 0, status: 'cancelled' };
+  const delivered = f.find((x) => x.deliveredAt);
+  if (delivered || /تم التوصيل|تم التسليم|واصل|delivered/i.test(tags)) {
+    return { step: 4, status: 'delivered', at: delivered?.deliveredAt || null };
+  }
+  if (['FULFILLED', 'PARTIALLY_FULFILLED', 'IN_PROGRESS'].includes(o.displayFulfillmentStatus) || /خرج للتوصيل|بالطريق|shipped/i.test(tags)) {
+    return { step: 3, status: 'shipped', at: f[0]?.inTransitAt || f[0]?.createdAt || null };
+  }
+  if (/تجهيز|تم التأكيد|مؤكد|confirmed|preparing/i.test(tags)) return { step: 2, status: 'preparing' };
+  return { step: 1, status: 'received' };
+}
+
+async function handleMyOrders(phone) {
+  const c = await customerByPhone(phone);
+  if (!c) return { orders: [] };
+  const id = c.id.split('/').pop();
+  const data = await admin(MY_ORDERS_QUERY, { q: `customer_id:${id}` });
+  return {
+    orders: (data.orders?.nodes || []).map((o) => {
+      const st = orderStep(o);
+      return {
+        id: o.id,
+        name: o.name,
+        createdAt: o.createdAt,
+        total: Number(o.totalPriceSet?.shopMoney?.amount || 0),
+        city: o.shippingAddress?.city || '',
+        address: o.shippingAddress?.address1 || '',
+        step: st.step,
+        status: st.status,
+        statusAt: st.at || null,
+        items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
+      };
+    }),
+  };
 }
 
 const PAYMENT_LABEL = {
@@ -2525,6 +2581,14 @@ const server = http.createServer(async (req, res) => {
         throw new AppError(400, 'طلب غير صالح');
       }
       return send(res, 200, await handleAiAsk(body, clientIp(req)));
+    }
+
+    if (req.method === 'GET' && p === '/api/orders/mine') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'myorders', 60, 10 * 60e3);
+      return send(res, 200, await handleMyOrders(phone));
     }
 
     if (req.method === 'POST' && (p === '/api/push/register' || p === '/api/push/unregister')) {
