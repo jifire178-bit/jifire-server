@@ -46,10 +46,17 @@ const num = (k, d) => {
 };
 
 const CFG = {
+  // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
+  app: {
+    minVersion: env('APP_MIN_VERSION'),
+    latestVersion: env('APP_LATEST_VERSION'),
+    updateUrl: env('APP_UPDATE_URL', 'https://app.jifrephone.workers.dev'),
+    updateMessage: env('APP_UPDATE_MESSAGE', 'يوجد تحديث جديد لتطبيق جي فاير. حدّث التطبيق للاستمرار بالطلب.'),
+  },
   // Loyalty points: earned on delivered orders, spent as a discount at checkout.
   loyalty: {
     enabled: bool('LOYALTY_ENABLED', true),
-    per1000: num('LOYALTY_POINTS_PER_1000', 1), // points per 1,000 IQD of the order (after discounts, no delivery)
+    per1000: num('LOYALTY_POINTS_PER_1000', 0.5), // points per 1,000 IQD of the order (after discounts, no delivery)
     minOrder: num('LOYALTY_MIN_ORDER', 10000), // smallest order that earns points
     pointValue: num('LOYALTY_POINT_VALUE', 10), // IQD per point when spent
     minRedeem: num('LOYALTY_MIN_REDEEM', 500), // points needed before spending
@@ -213,8 +220,15 @@ function saveState() {
 
 let tokenCache = { token: CFG.staticToken || null, exp: CFG.staticToken ? Infinity : 0 };
 
-async function adminToken() {
-  if (tokenCache.token && Date.now() < tokenCache.exp) return tokenCache.token;
+let tokenInFlight = null;
+/** One token request at a time (background jobs may ask together). */
+function adminToken() {
+  if (tokenCache.token && Date.now() < tokenCache.exp) return Promise.resolve(tokenCache.token);
+  tokenInFlight ??= fetchAdminToken().finally(() => (tokenInFlight = null));
+  return tokenInFlight;
+}
+
+async function fetchAdminToken() {
   if (!CFG.clientId || !CFG.clientSecret) {
     throw new AppError(500, 'إعدادات Shopify غير مكتملة على الخادم');
   }
@@ -2800,8 +2814,12 @@ const EDITABLE = [
   ['MSG_RECEIVED_BODY', 'إشعار استلام الطلب: النص', false],
   ['MSG_SHIPPED_TITLE', 'إشعار خروج الطلب للتوصيل: العنوان ({order} = رقم الطلب)', false],
   ['MSG_SHIPPED_BODY', 'إشعار خروج الطلب للتوصيل: النص ({order} = رقم الطلب)', false],
+  ['APP_MIN_VERSION', 'تحديث إجباري: أقل نسخة مسموحة من التطبيق (مثال 3.6.2) — الأقدم منها تُمنع وتظهر لها شاشة التحديث', false],
+  ['APP_LATEST_VERSION', 'أحدث نسخة (اختياري): تظهر رسالة «تحديث جديد متوفر» بدون منع', false],
+  ['APP_UPDATE_URL', 'رابط التحديث (Google Play أو رابط التحميل)', false],
+  ['APP_UPDATE_MESSAGE', 'رسالة شاشة التحديث', false],
   ['LOYALTY_ENABLED', 'نظام النقاط: مفعّل؟ (true / false)', false],
-  ['LOYALTY_POINTS_PER_1000', 'النقاط: كم نقطة لكل 1000 د.ع من قيمة المنتجات', false],
+  ['LOYALTY_POINTS_PER_1000', 'النقاط: كم نقطة لكل 1000 د.ع من قيمة المنتجات (0.5 = نقطة لكل 2000 د.ع)', false],
   ['LOYALTY_MIN_ORDER', 'النقاط: أقل قيمة طلب تكسب نقاط (د.ع)', false],
   ['LOYALTY_POINT_VALUE', 'النقاط: قيمة النقطة الواحدة عند الاستبدال (د.ع)', false],
   ['LOYALTY_MIN_REDEEM', 'النقاط: أقل رصيد يسمح بالاستبدال', false],
@@ -2934,6 +2952,45 @@ function clientIp(req) {
   return (fwd ? String(fwd).split(',')[0] : req.socket.remoteAddress || '').trim();
 }
 
+/** "3.10.2" vs "3.9" -> numeric part by part. */
+function versionLess(a, b) {
+  const pa = String(a || '0').split(/[.+]/).map((x) => parseInt(x, 10) || 0);
+  const pb = String(b || '0').split(/[.+]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length, 3); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0;
+  }
+  return false;
+}
+
+function appStatus(req) {
+  const v = String(req.headers['x-app-version'] || '');
+  const min = CFG.app.minVersion;
+  const latest = CFG.app.latestVersion || min;
+  return {
+    version: v || null,
+    minVersion: min || null,
+    latestVersion: latest || null,
+    updateUrl: CFG.app.updateUrl,
+    message: CFG.app.updateMessage,
+    forceUpdate: Boolean(min) && (!v || versionLess(v, min)),
+    updateAvailable: Boolean(latest) && Boolean(v) && versionLess(v, latest),
+  };
+}
+
+/** Old app versions (older ones send no version at all) can't order or log in. */
+function checkAppVersion(req) {
+  if (!CFG.app.minVersion) return;
+  if (appStatus(req).forceUpdate) {
+    throw new AppError(426, `${CFG.app.updateMessage}\n${CFG.app.updateUrl}`);
+  }
+}
+
+const VERSION_GATED = new Set([
+  '/api/config', '/api/orders', '/api/auth/otp/send', '/api/auth/otp/verify', '/api/discount/check',
+  '/api/addons/quote', '/api/loyalty/me', '/api/loyalty/referral', '/api/ai/ask',
+]);
+
 function checkAppKey(req) {
   if (CFG.appKey && req.headers['x-app-key'] !== CFG.appKey) {
     throw new AppError(401, 'غير مصرّح');
@@ -2945,6 +3002,13 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname.replace(/\/+$/, '') || '/';
   try {
     if (req.method === 'GET' && p === '/health') return send(res, 200, { ok: true });
+
+    if (req.method === 'GET' && p === '/api/app/status') {
+      checkAppKey(req);
+      return send(res, 200, appStatus(req));
+    }
+
+    if (VERSION_GATED.has(p) || p.startsWith('/api/aqsati/')) checkAppVersion(req);
 
     if (req.method === 'GET' && p === '/api/config') {
       checkAppKey(req);
@@ -3237,4 +3301,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+module.exports = { versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
