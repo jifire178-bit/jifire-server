@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.12';
+const APP_RELEASE = '3.9.10';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -281,7 +281,6 @@ function pruneState() {
   cap(state.refDevices, 50000);
   cap(state.tierPhones, 100000);
   olderThan(state.checkouts, 3 * 86400e3, (v) => v.at);
-  if (state.waseetLog) olderThan(state.waseetLog, 90 * 86400e3, (v) => Date.parse(v[v.length - 1]?.at || 0));
   if (state.abandonOffers) olderThan(state.abandonOffers, Math.max(60, CFG.abandon.everyDays * 2) * 86400e3);
   if (state.appCodes) olderThan(state.appCodes, 7 * 86400e3, (v) => v.exp);
   if (state.crashes) state.crashes = state.crashes.slice(0, 100);
@@ -1429,7 +1428,6 @@ query Fulfilled($q: String!) {
   orders(first: 50, sortKey: UPDATED_AT, reverse: true, query: $q) {
     nodes {
       id name updatedAt displayFulfillmentStatus phone cancelledAt tags
-      customAttributes { key value }
       customer { defaultPhoneNumber { phoneNumber } }
       shippingAddress { phone }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
@@ -1458,31 +1456,7 @@ async function checkFulfilledOrders() {
     for (const o of data.orders?.nodes || []) {
       if (o.updatedAt > newest) newest = o.updatedAt;
       const st = orderStep(o);
-      if (st.waseet?.text) noteWaseet(o.id, st.waseet, o.updatedAt);
-      if (o.updatedAt < since) continue;
-      // Every Al-Waseet move the customer should know about (postponed, phone off, with the driver...).
-      if (st.waseet?.push && !o.cancelledAt) {
-        const wk = `${o.id}:w:${st.waseet.text}`;
-        if (!op.done[wk]) {
-          op.done[wk] = Date.now();
-          const wPhones = new Set(
-            [o.phone, o.customer?.defaultPhoneNumber?.phoneNumber, o.shippingAddress?.phone].map(normalizePhone).filter(Boolean)
-          );
-          for (const ph of wPhones) {
-            for (const dev of [...(state.push[ph] || [])]) {
-              const r = await sendPush(dev.token, {
-                title: `تحديث توصيل طلبك ${o.name} 🚚`,
-                body: st.waseet.msg,
-                dataOnly: true,
-                data: { type: 'order', status: st.status, step: st.step, order: o.name, delivery: st.waseet.msg },
-              });
-              if (r === 'invalid') unregisterPushToken(dev.token);
-              log('waseet push', o.name, st.waseet.kind, ph.slice(-4), r);
-            }
-          }
-        }
-      }
-      if (!ORDER_TEXT[st.status]) continue;
+      if (!ORDER_TEXT[st.status] || o.updatedAt < since) continue;
       // One push per order per status (older state used the bare id for "shipped").
       const key = `${o.id}:${st.status}`;
       if (op.done[key] || (st.status === 'shipped' && op.done[o.id])) continue;
@@ -2504,78 +2478,13 @@ query MyOrders($q: String!) {
   }
 }`;
 
-// Al-Waseet status: the delivery system tags the order "waseet: <status>"
-// (Arabic text from Al-Waseet) every time the shipment moves.
-const WASEET_MAP = [
-  // [pattern, kind, step, tone, note for the customer, push?]
-  [/تم التسليم (?:الى|إلى|ل)?\s*(?:ال)?زبون|تسليم للزبون|تم التسليم بنجاح|واصل/, 'delivered', 4, 'ok', 'تم تسليم طلبك بنجاح ✅', false],
-  [/تم الارجاع|تم الإرجاع|ارجاع الى التاجر|إرجاع إلى التاجر|قيد الارجاع|قيد الإرجاع|مرتجع|راجع/, 'returned', 0, 'bad', 'طلبك راجع للمتجر. إذا تريده، تواصل ويانا ونرجع نرسله', true],
-  [/ملغي|ملغى|الغاء|إلغاء|رفض/, 'cancelled', 0, 'bad', 'شركة التوصيل سجّلت الطلب كملغي. إذا ما طلبت الإلغاء، تواصل ويانا', false],
-  [/مؤجل|تأجيل|تاجيل/, 'postponed', 3, 'warn', 'تأجل توصيل طلبك لموعد ثاني، ونعتذر عن التأخير', true],
-  [/مغلق|خارج (?:نطاق )?الخدمة/, 'closed', 3, 'warn', 'حاول المندوب يتصل بيك وجوالك مغلق. خلي جوالك متاح حتى يوصلك طلبك', true],
-  [/لا يرد|لايرد|عدم الرد|لا يجيب/, 'noanswer', 3, 'warn', 'حاول المندوب يتصل بيك وما رديت. خلي جوالك قريب منك', true],
-  [/تبليغ|ابلاغ|إبلاغ/, 'notice', 3, 'warn', 'شركة التوصيل سجّلت ملاحظة على طلبك، وراح يتواصل وياك المندوب', true],
-  [/عهدة المندوب|قيد التوصيل|مع المندوب|(?:الى|إلى) الزبون/, 'out', 3, 'ok', 'طلبك عند مندوب التوصيل وراح يوصلك قريباً. خلي جوالك قريب منك', true],
-  [/فرز|مخزن|في الطريق/, 'transit', 3, 'ok', 'طلبك بالطريق لمحافظتك 🚛', true],
-  [/مكتب المحافظة|في مكتب/, 'office', 3, 'ok', 'وصل طلبك لمكتب التوصيل بمحافظتك', true],
-  [/استلام|المندوب/, 'picked', 3, 'ok', 'استلم المندوب طلبك وبدأ شحنه 🚚', false], // the "shipped" push already says it
-  [/فعال|جديد|قيد المعالجة/, 'active', 2, 'ok', 'تم تسجيل طلبك لدى شركة التوصيل 📦', false],
-];
-function waseetClassify(text) {
-  for (const [re, kind, step, tone, msg, push] of WASEET_MAP) if (re.test(text)) return { text, kind, step, tone, msg, push };
-  return { text, kind: 'other', step: 3, tone: 'ok', msg: '', push: true };
-}
-function waseetInfo(tagList) {
-  const tag = [...(tagList || [])].reverse().find((t) => /^waseet\s*:/i.test(String(t)));
-  if (!tag) return null;
-  const w = waseetClassify(String(tag).replace(/^waseet\s*:\s*/i, '').trim());
-  if (!w.msg) w.msg = `حالة التوصيل: ${w.text}`;
-  return w;
-}
-// Al-Waseet keeps one tag at a time, so the history is recorded here as the
-// statuses arrive: the app shows the same sequence as the Al-Waseet panel.
-function noteWaseet(orderId, w, at) {
-  if (!w || !orderId) return;
-  state.waseetLog = state.waseetLog || {};
-  const log = (state.waseetLog[orderId] = state.waseetLog[orderId] || []);
-  if (log.length && log[log.length - 1].t === w.text) return;
-  log.push({ t: w.text, at: at || new Date().toISOString() });
-  if (log.length > 30) log.splice(0, log.length - 30);
-  saveState();
-}
-function waseetTimeline(orderId) {
-  return ((state.waseetLog || {})[orderId] || []).map((e) => {
-    const c = waseetClassify(e.t);
-    return { status: e.t, note: c.kind === 'other' ? '' : c.msg, tone: c.tone, kind: c.kind, at: e.at };
-  });
-}
-
 function orderStep(o) {
-  const w = waseetInfo(o.tags);
-  if (w && !o.cancelledAt) {
-    if (w.kind === 'delivered') return { step: 4, status: 'delivered', at: null, waseet: w };
-    if (w.kind === 'returned') return { step: 0, status: 'returned', at: null, waseet: w };
-    if (w.kind === 'cancelled') return { step: 0, status: 'cancelled', at: null, waseet: w };
-    return { step: w.step, status: w.step === 2 ? 'preparing' : 'shipped', at: null, waseet: w };
-  }
-  const tags = (o.tags || []).filter((t) => !/^waseet\s*:/i.test(String(t))).join(' ');
+  const tags = (o.tags || []).join(' ');
   const f = o.fulfillments || [];
   if (o.cancelledAt || /إلغاء|ملغي|cancel/i.test(tags)) return { step: 0, status: 'cancelled' };
   const delivered = f.find((x) => x.deliveredAt);
   if (delivered || /تم التوصيل|تم التسليم|واصل|delivered/i.test(tags)) {
     return { step: 4, status: 'delivered', at: delivered?.deliveredAt || null };
-  }
-  // Sent to Al-Waseet but no driver yet: fulfilling the order only uploads it to
-  // the delivery company, so it stays "preparing" until Al-Waseet moves it
-  // (24h safety net in case no status ever arrives).
-  const viaWaseet = (o.customAttributes || []).some((a) => a.key === '_alwaseet_region_id' && a.value);
-  const fulfilledAt = Date.parse(f[0]?.createdAt || '') || 0;
-  if (viaWaseet && fulfilledAt && Date.now() - fulfilledAt < 24 * 3600e3) {
-    return {
-      step: 2,
-      status: 'preparing',
-      waseet: { kind: 'handed', text: '', push: false, msg: 'جهّزنا طلبك وسلّمناه لشركة التوصيل، وتتحدث حالته هنا أول ما يستلمه المندوب 📦' },
-    };
   }
   if (['FULFILLED', 'PARTIALLY_FULFILLED', 'IN_PROGRESS'].includes(o.displayFulfillmentStatus) || /خرج للتوصيل|بالطريق|shipped/i.test(tags)) {
     return { step: 3, status: 'shipped', at: f[0]?.inTransitAt || f[0]?.createdAt || null };
@@ -2592,7 +2501,6 @@ async function handleMyOrders(phone) {
   return {
     orders: (data.orders?.nodes || []).map((o) => {
       const st = orderStep(o);
-      if (st.waseet?.text) noteWaseet(o.id, st.waseet);
       return {
         id: o.id,
         name: o.name,
@@ -2603,8 +2511,6 @@ async function handleMyOrders(phone) {
         step: st.step,
         status: st.status,
         statusAt: st.at || null,
-        delivery: st.waseet?.msg || '',
-        deliveryLog: waseetTimeline(o.id),
         canCancel: canCustomerCancel(o),
         cancelUntil: new Date(Date.parse(o.createdAt) + cancelWindowMs()).toISOString(),
         items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
@@ -2739,10 +2645,7 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: '_alwaseet_city_id', value: String(order.address.cityId) },
       { key: 'المنطقة', value: order.address.area },
       { key: '_alwaseet_region_id', value: String(order.address.regionId) },
-      // The Al-Waseet upload reads the landmark from the English key "landmark" (Arabic value).
-      ...(order.address.landmark
-        ? [{ key: 'landmark', value: order.address.landmark }, { key: 'أقرب نقطة دالة', value: order.address.landmark }]
-        : [])
+      ...(order.address.landmark ? [{ key: 'أقرب نقطة دالة', value: order.address.landmark }] : [])
     );
   }
   const consent = state.consent?.[order.customer.phone];
@@ -5697,4 +5600,4 @@ if (require.main === module) {
 }
 
 module.exports = {
-  appFlags, dailySummary, waseetInfo, orderStep, waseetTimeline, noteWaseet, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+  appFlags, dailySummary, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
