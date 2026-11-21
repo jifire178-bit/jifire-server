@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.11';
+const APP_RELEASE = '3.9.12';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -281,6 +281,7 @@ function pruneState() {
   cap(state.refDevices, 50000);
   cap(state.tierPhones, 100000);
   olderThan(state.checkouts, 3 * 86400e3, (v) => v.at);
+  if (state.waseetLog) olderThan(state.waseetLog, 90 * 86400e3, (v) => Date.parse(v[v.length - 1]?.at || 0));
   if (state.abandonOffers) olderThan(state.abandonOffers, Math.max(60, CFG.abandon.everyDays * 2) * 86400e3);
   if (state.appCodes) olderThan(state.appCodes, 7 * 86400e3, (v) => v.exp);
   if (state.crashes) state.crashes = state.crashes.slice(0, 100);
@@ -1457,6 +1458,7 @@ async function checkFulfilledOrders() {
     for (const o of data.orders?.nodes || []) {
       if (o.updatedAt > newest) newest = o.updatedAt;
       const st = orderStep(o);
+      if (st.waseet?.text) noteWaseet(o.id, st.waseet, o.updatedAt);
       if (o.updatedAt < since) continue;
       // Every Al-Waseet move the customer should know about (postponed, phone off, with the driver...).
       if (st.waseet?.push && !o.cancelledAt) {
@@ -2505,28 +2507,55 @@ query MyOrders($q: String!) {
 // Al-Waseet status: the delivery system tags the order "waseet: <status>"
 // (Arabic text from Al-Waseet) every time the shipment moves.
 const WASEET_MAP = [
-  // [pattern, kind, step, message for the customer, push?]
-  [/تم التسليم (?:الى|إلى|ل)?\s*(?:ال)?زبون|تسليم للزبون|تم التسليم بنجاح|واصل|مستلم/, 'delivered', 4, 'تم تسليم طلبك بنجاح ✅', false],
-  [/راجع|ارجاع|إرجاع|مرتجع|رفض|ملغي|الغاء|إلغاء/, 'returning', 3, 'طلبك راجع للمتجر. إذا تريده، تواصل ويانا ونرجع نرسله', true],
-  [/مؤجل|تأجيل|تاجيل/, 'postponed', 3, 'تأجل توصيل طلبك لموعد ثاني، ونعتذر عن التأخير', true],
-  [/مغلق|لا يرد|لايرد|خارج (?:نطاق )?الخدمة|عدم الرد/, 'unreachable', 3, 'حاول مندوب التوصيل يتصل بيك وجوالك مغلق أو ما يرد. خلي جوالك متاح حتى يوصلك طلبك', true],
-  [/عهدة المندوب|قيد التوصيل|مع المندوب|في الطريق (?:الى|إلى) الزبون/, 'out', 3, 'طلبك عند مندوب التوصيل وراح يوصلك قريباً. خلي جوالك قريب منك', true],
-  [/فرز|مخزن|مكتب|في الطريق/, 'transit', 3, 'طلبك بالطريق لمحافظتك 🚛', true],
-  [/استلام|المندوب/, 'picked', 3, 'استلم المندوب طلبك وبدأ شحنه 🚚', false], // the "shipped" push already says it
-  [/فعال|جديد|قيد المعالجة/, 'active', 2, 'تم تأكيد طلبك وجاري تجهيزه للشحن 📦', false],
+  // [pattern, kind, step, tone, note for the customer, push?]
+  [/تم التسليم (?:الى|إلى|ل)?\s*(?:ال)?زبون|تسليم للزبون|تم التسليم بنجاح|واصل/, 'delivered', 4, 'ok', 'تم تسليم طلبك بنجاح ✅', false],
+  [/تم الارجاع|تم الإرجاع|ارجاع الى التاجر|إرجاع إلى التاجر|قيد الارجاع|قيد الإرجاع|مرتجع|راجع/, 'returned', 0, 'bad', 'طلبك راجع للمتجر. إذا تريده، تواصل ويانا ونرجع نرسله', true],
+  [/ملغي|ملغى|الغاء|إلغاء|رفض/, 'cancelled', 0, 'bad', 'شركة التوصيل سجّلت الطلب كملغي. إذا ما طلبت الإلغاء، تواصل ويانا', false],
+  [/مؤجل|تأجيل|تاجيل/, 'postponed', 3, 'warn', 'تأجل توصيل طلبك لموعد ثاني، ونعتذر عن التأخير', true],
+  [/مغلق|خارج (?:نطاق )?الخدمة/, 'closed', 3, 'warn', 'حاول المندوب يتصل بيك وجوالك مغلق. خلي جوالك متاح حتى يوصلك طلبك', true],
+  [/لا يرد|لايرد|عدم الرد|لا يجيب/, 'noanswer', 3, 'warn', 'حاول المندوب يتصل بيك وما رديت. خلي جوالك قريب منك', true],
+  [/تبليغ|ابلاغ|إبلاغ/, 'notice', 3, 'warn', 'شركة التوصيل سجّلت ملاحظة على طلبك، وراح يتواصل وياك المندوب', true],
+  [/عهدة المندوب|قيد التوصيل|مع المندوب|(?:الى|إلى) الزبون/, 'out', 3, 'ok', 'طلبك عند مندوب التوصيل وراح يوصلك قريباً. خلي جوالك قريب منك', true],
+  [/فرز|مخزن|في الطريق/, 'transit', 3, 'ok', 'طلبك بالطريق لمحافظتك 🚛', true],
+  [/مكتب المحافظة|في مكتب/, 'office', 3, 'ok', 'وصل طلبك لمكتب التوصيل بمحافظتك', true],
+  [/استلام|المندوب/, 'picked', 3, 'ok', 'استلم المندوب طلبك وبدأ شحنه 🚚', false], // the "shipped" push already says it
+  [/فعال|جديد|قيد المعالجة/, 'active', 2, 'ok', 'تم تسجيل طلبك لدى شركة التوصيل 📦', false],
 ];
+function waseetClassify(text) {
+  for (const [re, kind, step, tone, msg, push] of WASEET_MAP) if (re.test(text)) return { text, kind, step, tone, msg, push };
+  return { text, kind: 'other', step: 3, tone: 'ok', msg: '', push: true };
+}
 function waseetInfo(tagList) {
   const tag = [...(tagList || [])].reverse().find((t) => /^waseet\s*:/i.test(String(t)));
   if (!tag) return null;
-  const text = String(tag).replace(/^waseet\s*:\s*/i, '').trim();
-  for (const [re, kind, step, msg, push] of WASEET_MAP) if (re.test(text)) return { text, kind, step, msg, push };
-  return { text, kind: 'other', step: 3, msg: `حالة التوصيل: ${text}`, push: true };
+  const w = waseetClassify(String(tag).replace(/^waseet\s*:\s*/i, '').trim());
+  if (!w.msg) w.msg = `حالة التوصيل: ${w.text}`;
+  return w;
+}
+// Al-Waseet keeps one tag at a time, so the history is recorded here as the
+// statuses arrive: the app shows the same sequence as the Al-Waseet panel.
+function noteWaseet(orderId, w, at) {
+  if (!w || !orderId) return;
+  state.waseetLog = state.waseetLog || {};
+  const log = (state.waseetLog[orderId] = state.waseetLog[orderId] || []);
+  if (log.length && log[log.length - 1].t === w.text) return;
+  log.push({ t: w.text, at: at || new Date().toISOString() });
+  if (log.length > 30) log.splice(0, log.length - 30);
+  saveState();
+}
+function waseetTimeline(orderId) {
+  return ((state.waseetLog || {})[orderId] || []).map((e) => {
+    const c = waseetClassify(e.t);
+    return { status: e.t, note: c.kind === 'other' ? '' : c.msg, tone: c.tone, kind: c.kind, at: e.at };
+  });
 }
 
 function orderStep(o) {
   const w = waseetInfo(o.tags);
   if (w && !o.cancelledAt) {
     if (w.kind === 'delivered') return { step: 4, status: 'delivered', at: null, waseet: w };
+    if (w.kind === 'returned') return { step: 0, status: 'returned', at: null, waseet: w };
+    if (w.kind === 'cancelled') return { step: 0, status: 'cancelled', at: null, waseet: w };
     return { step: w.step, status: w.step === 2 ? 'preparing' : 'shipped', at: null, waseet: w };
   }
   const tags = (o.tags || []).filter((t) => !/^waseet\s*:/i.test(String(t))).join(' ');
@@ -2563,6 +2592,7 @@ async function handleMyOrders(phone) {
   return {
     orders: (data.orders?.nodes || []).map((o) => {
       const st = orderStep(o);
+      if (st.waseet?.text) noteWaseet(o.id, st.waseet);
       return {
         id: o.id,
         name: o.name,
@@ -2574,6 +2604,7 @@ async function handleMyOrders(phone) {
         status: st.status,
         statusAt: st.at || null,
         delivery: st.waseet?.msg || '',
+        deliveryLog: waseetTimeline(o.id),
         canCancel: canCustomerCancel(o),
         cancelUntil: new Date(Date.parse(o.createdAt) + cancelWindowMs()).toISOString(),
         items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
@@ -5666,4 +5697,4 @@ if (require.main === module) {
 }
 
 module.exports = {
-  appFlags, dailySummary, waseetInfo, orderStep, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+  appFlags, dailySummary, waseetInfo, orderStep, waseetTimeline, noteWaseet, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
