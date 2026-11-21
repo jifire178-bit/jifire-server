@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.8.5';
+const APP_RELEASE = '3.8.7';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -569,6 +569,11 @@ async function evaluateDiscount(code, priced, order) {
   const phone = order?.customer?.phone;
   if (d.appliesOncePerCustomer && phone && state.discountUses?.[`${code.toLowerCase()}|${phone}`]) {
     throw new AppError(400, 'استخدمت هذا الكود من قبل');
+  }
+  // Same phone, another number/account: still once.
+  const dev = order?._device || currentDevice();
+  if (d.appliesOncePerCustomer && dev && state.discountDevices?.[`${code.toLowerCase()}|${dev}`]) {
+    throw new AppError(400, 'هذا الكود مستخدم مسبقاً على هذا الجهاز');
   }
 
   const goods = priced.items.filter((i) => !i.service);
@@ -1439,6 +1444,16 @@ async function saveLedger(customerId, ledger) {
 
 const ledgerBalance = (l) => l.entries.reduce((a, e) => a + (Number(e.p) || 0), 0);
 
+// Anti-farming: lucky-wheel points can only be spent once the customer has a
+// delivered order (fake accounts made just to spin never cash out).
+const hasDelivered = (l) => Number(l.tier?.orders || 0) > 0 || l.entries.some((e) => e.t === 'earn' && e.p > 0);
+function lockedWheelPoints(l) {
+  if (hasDelivered(l)) return 0;
+  const wheel = l.entries.reduce((a, e) => a + (e.t === 'wheel' && e.p > 0 ? e.p : 0), 0);
+  return Math.max(0, Math.min(wheel, ledgerBalance(l)));
+}
+const redeemableBalance = (l) => Math.max(0, ledgerBalance(l) - lockedWheelPoints(l));
+
 /** Sets entry `k` to `p` points; returns true when something changed. */
 function setEntry(ledger, k, p, info = {}) {
   p = Math.trunc(p);
@@ -1785,6 +1800,8 @@ async function handleLoyaltyMe(phone) {
     tier: TIERS.enabled ? tierInfo(ledger.tier) : null,
     balance,
     value: balance * LOY.pointValue,
+    redeemable: redeemableBalance(ledger),
+    locked: lockedWheelPoints(ledger),
     pending,
     code: referralCode(c.id),
     referral: {
@@ -1861,6 +1878,11 @@ async function spinWheel(phone) {
     const w = wheelPublic(ledger);
     if (!w.enabled) throw new AppError(400, 'عجلة الحظ غير متاحة حالياً');
     if (!w.canSpin) throw new AppError(429, 'لفّيت العجلة مسبقاً، جرّب حظك مرة ثانية لاحقاً');
+    const dev = currentDevice();
+    if (!dev) throw new AppError(400, 'حدّث التطبيق حتى تلفّ العجلة');
+    if (state.wheelDevices?.[dev] === baghdadDay()) {
+      throw new AppError(429, 'هذا الجهاز لفّ العجلة اليوم بحساب ثاني. لفّة وحدة لكل جهاز باليوم');
+    }
     const prizes = wheelPrizes();
     const total = prizes.reduce((a, x) => a + x.weight, 0);
     // Weighted draw in 1/1,000,000 steps.
@@ -1878,6 +1900,9 @@ async function spinWheel(phone) {
     ledger.wheel = { last: now, prize: prize.points, spins: Number(ledger.wheel?.spins || 0) + 1 };
     state.wheelSpun = state.wheelSpun || {};
     state.wheelSpun[phone] = baghdadDay();
+    state.wheelDevices = state.wheelDevices || {};
+    state.wheelDevices[dev] = baghdadDay();
+    for (const [k, d] of Object.entries(state.wheelDevices)) if (d !== baghdadDay()) delete state.wheelDevices[k];
     if (prize.points > 0) setEntry(ledger, 'wheel:' + now, prize.points, { t: 'wheel' });
     await saveLedger(id, ledger);
     state.wheelStats = state.wheelStats || { spins: 0, wins: 0, points: 0 };
@@ -1972,6 +1997,14 @@ async function handleReferral(phone, body) {
   if (!ref.customer) throw new AppError(400, 'كود الدعوة غير صحيح');
   return withLoyaltyLock(c.id, async () => {
     const { ledger, orders, createdAt } = await loadLedger(c.id);
+    const dev = currentDevice();
+    if (dev) {
+      const refPhone = normalizePhone(ref.customer.defaultPhoneNumber?.phoneNumber) || ref.customer.defaultPhoneNumber?.phoneNumber;
+      if (refPhone && (state.devicePhones?.[dev] || []).includes(refPhone)) {
+        throw new AppError(400, 'لا يمكن استخدام كود دعوة من حساب على نفس الجهاز');
+      }
+      if (state.refDevices?.[dev]) throw new AppError(400, 'تم استخدام كود دعوة على هذا الجهاز من قبل');
+    }
     if (ledger.ref?.by) throw new AppError(400, 'سبق أن أضفت كود دعوة');
     if (!isNewAccount(orders, createdAt)) throw new AppError(400, 'كود الدعوة للحسابات الجديدة فقط قبل أول طلب');
     // The inviter's account must be older than the invited one.
@@ -1981,6 +2014,11 @@ async function handleReferral(phone, body) {
     }
     ledger.ref = { by: referrer, at: new Date().toISOString() };
     await saveLedger(c.id, ledger);
+    if (dev) {
+      state.refDevices = state.refDevices || {};
+      state.refDevices[dev] = Date.now();
+      saveState();
+    }
     return { ok: true, friendPoints: LOY.friend };
   });
 }
@@ -1994,11 +2032,13 @@ async function placeOrderWithPoints(order) {
   if (!cid) throw new AppError(400, 'رصيد نقاطك غير كافٍ');
   return withLoyaltyLock(cid, async () => {
     const { ledger } = await loadLedger(cid);
-    const balance = ledgerBalance(ledger);
+    const balance = redeemableBalance(ledger);
     const priced = await priceCart(order.lines);
     const maxPts = Math.floor((priced.subtotal * LOY.maxRedeemPct) / 100 / LOY.pointValue);
     const points = Math.min(balance, maxPts);
-    if (balance < LOY.minRedeem || points <= 0) throw new AppError(400, 'رصيد نقاطك غير كافٍ');
+    if (balance < LOY.minRedeem || points <= 0) {
+      throw new AppError(400, lockedWheelPoints(ledger) ? 'نقاط عجلة الحظ تُفعّل بعد استلام أول طلب لك' : 'رصيد نقاطك غير كافٍ');
+    }
     priced.discount = { code: 'JIFIRE-POINTS', title: 'نقاط الولاء', amount: points * LOY.pointValue, points, freeShipping: false };
     const created = await createShopifyOrder(order, priced, { paid: false });
     setEntry(ledger, 'redeem:' + created.orderId, -points, { t: 'redeem', o: created.orderName });
@@ -2441,6 +2481,11 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   if (disc && !disc.points) {
     state.discountUses = state.discountUses || {};
     state.discountUses[`${disc.code.toLowerCase()}|${order.customer.phone}`] = Date.now();
+    const dev = order._device || currentDevice();
+    if (dev) {
+      state.discountDevices = state.discountDevices || {};
+      state.discountDevices[`${disc.code.toLowerCase()}|${dev}`] = Date.now();
+    }
     saveState();
   }
   return {
@@ -2557,7 +2602,9 @@ function readSession(req) {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   try {
     const s = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    return s.e > Date.now() && typeof s.p === 'string' ? s.p : null;
+    const ok = s.e > Date.now() && typeof s.p === 'string' ? s.p : null;
+    if (ok) rememberDevicePhone(ok);
+    return ok;
   } catch {
     return null;
   }
@@ -3096,7 +3143,32 @@ function validateOrder(body, opts = {}) {
     usePoints: o.usePoints === true,
     marketing: o.marketing === true,
     idempotencyKey,
+    _device: currentDevice(),
   };
+}
+
+// ------------------------------------------------------- device lock ---
+// The app sends X-Device-Id = sha256 of Android's ID for this app (it stays
+// the same after a new phone number, a new account or a reinstall; only a
+// factory reset changes it). Kept salted+hashed again here, never raw.
+const { AsyncLocalStorage } = require('node:async_hooks');
+const reqContext = new AsyncLocalStorage();
+function deviceFromHeader(req) {
+  const raw = String(req.headers['x-device-id'] || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(raw)) return null;
+  return crypto.createHmac('sha256', 'jf-device:' + (CFG.clientSecret || CFG.appKey || '')).update(raw).digest('base64url').slice(0, 32);
+}
+const currentDevice = () => reqContext.getStore()?.device || null;
+
+/** Phones seen on each device (last 10), to spot one phone used for many accounts. */
+function rememberDevicePhone(phone) {
+  const dev = currentDevice();
+  if (!dev || !phone) return;
+  state.devicePhones = state.devicePhones || {};
+  const list = state.devicePhones[dev] || [];
+  if (list[0] === phone) return;
+  state.devicePhones[dev] = [phone, ...list.filter((x) => x !== phone)].slice(0, 10);
+  saveState();
 }
 
 // ---------------------------------------------------------- rate limits ---
@@ -4271,7 +4343,8 @@ function checkAppKey(req) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => reqContext.run({ device: deviceFromHeader(req) }, () => handleRequest(req, res)));
+async function handleRequest(req, res) {
   const url = new URL(req.url, 'http://local');
   const p = url.pathname.replace(/\/+$/, '') || '/';
   try {
@@ -4632,7 +4705,7 @@ const server = http.createServer(async (req, res) => {
     if (status >= 500) log('error', req.method, p, e.stack || e.message);
     send(res, status, { error: e instanceof AppError ? e.message : 'خطأ في الخادم، حاول مرة أخرى' });
   }
-});
+}
 
 function redirect(res, location) {
   res.writeHead(302, { Location: location, 'Cache-Control': 'no-store' });
