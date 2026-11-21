@@ -2702,6 +2702,16 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
   }
   if (existingId) {
     input.customer = { toAssociate: { id: existingId } };
+    // An order email that belongs to ANOTHER customer makes Shopify move the
+    // order to that customer (then it's missing from the buyer's «طلباتي»).
+    // Keep the order on the phone's customer: the email stays in the notes.
+    if (input.email) {
+      const ownerEmail = (await customerByPhone(order.customer.phone).catch(() => null))?.defaultEmailAddress?.emailAddress || '';
+      if (ownerEmail.toLowerCase() !== String(input.email).toLowerCase()) {
+        input.customAttributes = [...(input.customAttributes || []), { key: 'البريد الإلكتروني', value: input.email }];
+        input.email = ownerEmail || null;
+      }
+    }
   } else if (CFG.upsertCustomer) {
     input.customer = {
       toUpsert: {
