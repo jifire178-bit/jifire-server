@@ -5158,6 +5158,17 @@ async function handleRequest(req, res) {
   const p = url.pathname.replace(/\/+$/, '') || '/';
   try {
     if (req.method === 'GET' && p === '/health') return send(res, 200, { ok: true });
+    // Al-Waseet governorates and regions for the website's cart (public, cached).
+    if (req.method === 'GET' && p === '/waseet.json') {
+      const body = (send.waseet = send.waseet || JSON.stringify(WASEET.map((c) => [c.id, c.name, c.regions])));
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': '*',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(body);
+    }
 
     if (req.method === 'GET' && p === '/update-banner.jpg') {
       res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=86400' });
