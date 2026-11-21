@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.8.1';
+const APP_RELEASE = '3.8.2';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
