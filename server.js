@@ -62,7 +62,7 @@ const CFG = {
   // Loyalty points: earned on delivered orders, spent as a discount at checkout.
   loyalty: {
     enabled: bool('LOYALTY_ENABLED', true),
-    per1000: num('LOYALTY_POINTS_PER_1000', 0.5), // points per 1,000 IQD of the order (after discounts, no delivery)
+    per1000: num('LOYALTY_POINTS_PER_1000', 0.2), // points per 1,000 IQD of the order (after discounts, no delivery)
     minOrder: num('LOYALTY_MIN_ORDER', 10000), // smallest order that earns points
     pointValue: num('LOYALTY_POINT_VALUE', 10), // IQD per point when spent
     minRedeem: num('LOYALTY_MIN_REDEEM', 500), // points needed before spending
@@ -77,7 +77,7 @@ const CFG = {
     silver: num('TIER_SILVER_MIN', 1000000),
     gold: num('TIER_GOLD_MIN', 3000000),
     vip: num('TIER_VIP_MIN', 7000000),
-    mult: [1, num('TIER_SILVER_MULT', 1.25), num('TIER_GOLD_MULT', 1.5), num('TIER_VIP_MULT', 2)],
+    mult: [1, num('TIER_SILVER_MULT', 1.5), num('TIER_GOLD_MULT', 2), num('TIER_VIP_MULT', 2.5)],
     vipBonus: num('TIER_VIP_BONUS', 500), // one-time gift on reaching VIP
     vipFreeDelivery: bool('TIER_VIP_FREE_DELIVERY', false),
   },
@@ -1487,9 +1487,12 @@ const tierMult = (i) => (TIERS.enabled && LOY.enabled ? Number(TIERS.mult[i]) ||
 const fmtMult = (m) => '×' + String(Math.round(m * 100) / 100);
 
 function tierPerks(i) {
-  const pts = `نقاط ${fmtMult(tierMult(i))} على كل طلب`;
+  // e.g. "نقاط ×1.4 (≈ 7,000 د.ع لكل مليون)"
+  const perMillion = (k) => Math.round(LOY.per1000 * tierMult(k) * 1000 * LOY.pointValue);
+  const iqd = (n) => n.toLocaleString('en-US') + ' د.ع';
+  const pts = `نقاط ${fmtMult(tierMult(i))} (≈ ${iqd(perMillion(i))} لكل مليون)`;
   return [
-    ['نقاط على كل طلب مكتمل', 'اربح نقاط من دعوة أصدقائك'],
+    [`نقاط على كل طلب (≈ ${iqd(perMillion(0))} لكل مليون)`, 'اربح نقاط من دعوة أصدقائك'],
     [pts, 'تنبيه مبكر بالعروض'],
     [pts, 'أولوية بخدمة الدعم', 'عروض حصرية'],
     [
@@ -3484,7 +3487,7 @@ const ADMIN_META = {
   APP_UPDATE_URL: ['رابط التحديث', 'رابط Google Play أو رابط التحميل'],
   APP_UPDATE_MESSAGE: ['نص شاشة التحديث', ''],
   LOYALTY_ENABLED: ['تفعيل نظام النقاط', ''],
-  LOYALTY_POINTS_PER_1000: ['النقاط لكل 1,000 د.ع', '0.5 = نقطة لكل 2,000 د.ع'],
+  LOYALTY_POINTS_PER_1000: ['النقاط لكل 1,000 د.ع', '0.2 = مكافأة 2,000 د.ع لكل مليون (البرونزي)، والمستويات تزيد عليها'],
   LOYALTY_MIN_ORDER: ['أقل قيمة طلب تكسب نقاط (د.ع)', ''],
   LOYALTY_POINT_VALUE: ['قيمة النقطة عند الاستبدال (د.ع)', ''],
   LOYALTY_MIN_REDEEM: ['أقل رصيد للاستبدال (نقطة)', ''],
@@ -3496,9 +3499,9 @@ const ADMIN_META = {
   TIER_SILVER_MIN: ['🥈 فضي — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
   TIER_GOLD_MIN: ['🥇 ذهبي — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
   TIER_VIP_MIN: ['💎 VIP — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
-  TIER_SILVER_MULT: ['🥈 مضاعف نقاط الفضي', '1.25 = ربع نقاط إضافية'],
-  TIER_GOLD_MULT: ['🥇 مضاعف نقاط الذهبي', '1.5 = نصف نقاط إضافية'],
-  TIER_VIP_MULT: ['💎 مضاعف نقاط VIP', '2 = ضعف النقاط'],
+  TIER_SILVER_MULT: ['🥈 مضاعف نقاط الفضي', '1.5 (≈ 3,000 د.ع لكل مليون)'],
+  TIER_GOLD_MULT: ['🥇 مضاعف نقاط الذهبي', '2 (≈ 4,000 د.ع لكل مليون)'],
+  TIER_VIP_MULT: ['💎 مضاعف نقاط VIP', '2.5 (≈ 5,000 د.ع لكل مليون)'],
   TIER_VIP_BONUS: ['💎 هدية الوصول لـ VIP (نقطة)', 'مرة واحدة لكل زبون. 0 = بدون'],
   TIER_VIP_FREE_DELIVERY: ['💎 توصيل مجاني لـ VIP', 'أجرة التوصيل = 0 لكل طلبات VIP'],
   MSG_SUCCESS: ['رسالة نجاح الطلب (توصيل)', ''],
