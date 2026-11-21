@@ -1428,6 +1428,7 @@ query Fulfilled($q: String!) {
   orders(first: 50, sortKey: UPDATED_AT, reverse: true, query: $q) {
     nodes {
       id name updatedAt displayFulfillmentStatus phone cancelledAt tags
+      customAttributes { key value }
       customer { defaultPhoneNumber { phoneNumber } }
       shippingAddress { phone }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
@@ -2534,6 +2535,18 @@ function orderStep(o) {
   const delivered = f.find((x) => x.deliveredAt);
   if (delivered || /تم التوصيل|تم التسليم|واصل|delivered/i.test(tags)) {
     return { step: 4, status: 'delivered', at: delivered?.deliveredAt || null };
+  }
+  // Sent to Al-Waseet but no driver yet: fulfilling the order only uploads it to
+  // the delivery company, so it stays "preparing" until Al-Waseet moves it
+  // (24h safety net in case no status ever arrives).
+  const viaWaseet = (o.customAttributes || []).some((a) => a.key === '_alwaseet_region_id' && a.value);
+  const fulfilledAt = Date.parse(f[0]?.createdAt || '') || 0;
+  if (viaWaseet && fulfilledAt && Date.now() - fulfilledAt < 24 * 3600e3) {
+    return {
+      step: 2,
+      status: 'preparing',
+      waseet: { kind: 'handed', text: '', push: false, msg: 'جهّزنا طلبك وسلّمناه لشركة التوصيل، وتتحدث حالته هنا أول ما يستلمه المندوب 📦' },
+    };
   }
   if (['FULFILLED', 'PARTIALLY_FULFILLED', 'IN_PROGRESS'].includes(o.displayFulfillmentStatus) || /خرج للتوصيل|بالطريق|shipped/i.test(tags)) {
     return { step: 3, status: 'shipped', at: f[0]?.inTransitAt || f[0]?.createdAt || null };
