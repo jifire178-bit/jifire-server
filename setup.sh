@@ -90,9 +90,13 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# Extra names (e.g. app.jifirephone.com) served next to the main link.
+EXTRA=$(grep '^EXTRA_DOMAINS=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' ' | tr ',' ' ' || true)
+SITES=$DOMAIN
+for d in $EXTRA; do [ -n "$d" ] && [ "$d" != "$DOMAIN" ] && SITES="$SITES, $d"; done
 mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
-$DOMAIN {
+$SITES {
   reverse_proxy 127.0.0.1:8080
 }
 EOF
