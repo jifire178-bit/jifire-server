@@ -3568,7 +3568,7 @@ async function handleConfig() {
     discounts: true,
     loyalty: loyaltyRules(),
     installments: aqsatiEnabled() ? CFG.aqsati.plans.map(([months, rate]) => ({ months, rate })) : [],
-    shareBase: CFG.publicUrl,
+    shareBase: (env('SHARE_URL', 'https://app.jifirephone.com') || CFG.publicUrl).replace(/\/+$/, ''),
     assistant: { ai: Boolean(CFG.ai.key) },
     texts: {
       receivedTitle: CFG.texts.receivedTitle,
