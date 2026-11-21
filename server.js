@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.9';
+const APP_RELEASE = '3.9.10';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -2586,6 +2586,14 @@ const PAYMENT_LABEL = {
   aqsati: 'أقساطي (كي كارد)',
 };
 
+// The order note carries the nearest landmark first (Al-Waseet reads the note),
+// then whatever the customer wrote.
+function orderNote(order, pickup) {
+  const lm = !pickup ? order.address?.landmark : '';
+  const parts = [lm ? `أقرب نقطة دالة: ${lm}` : '', order.note || ''].filter(Boolean);
+  return parts.length ? parts.join(' — ') : null;
+}
+
 async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqsati }) {
   const { fee, discount, total } = orderTotals(order, priced);
   const disc = priced.discount;
@@ -2631,7 +2639,13 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: 'talabati_city_id', value: String(order.address.cityId) },
       { key: 'talabati_region_id', value: String(order.address.regionId) },
       { key: 'الوسيط - المحافظة', value: `${order.address.governorate} (${order.address.cityId})` },
-      { key: 'الوسيط - المنطقة', value: `${order.address.area} (${order.address.regionId})` }
+      { key: 'الوسيط - المنطقة', value: `${order.address.area} (${order.address.regionId})` },
+      // Same keys as website (checkout) orders: the live Al-Waseet upload reads these.
+      { key: 'المحافظة', value: order.address.governorate },
+      { key: '_alwaseet_city_id', value: String(order.address.cityId) },
+      { key: 'المنطقة', value: order.address.area },
+      { key: '_alwaseet_region_id', value: String(order.address.regionId) },
+      ...(order.address.landmark ? [{ key: 'أقرب نقطة دالة', value: order.address.landmark }] : [])
     );
   }
   const consent = state.consent?.[order.customer.phone];
@@ -2671,7 +2685,7 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
     })),
     phone: order.customer.phone,
     email: order.customer.email || null,
-    note: order.note || null,
+    note: orderNote(order, pickup),
     tags,
     customAttributes: attrs,
     sourceName: 'jifire-app',
@@ -3488,6 +3502,7 @@ function validateOrder(body, opts = {}) {
       street: str(o.address?.street, 160),
       landmark: str(o.address?.landmark, 160),
     };
+    if (!opts.skipPayment && address.landmark.length < 3) throw new AppError(400, 'اكتب أقرب نقطة دالة لعنوانك');
   }
 
   const payment = ['cod', 'card', 'aqsati'].includes(o.payment) ? o.payment : null;
