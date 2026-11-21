@@ -86,10 +86,10 @@ const CFG = {
   wheel: {
     enabled: bool('WHEEL_ENABLED', true),
     everyDays: num('WHEEL_EVERY_DAYS', 1),
-    // 1 point = 10 IQD: 50 pts = 500 د.ع, 100 = 1,000, 200 = 2,000, 500 = 5,000
+    // 1 point = 10 IQD: 50 pts = 500 د.ع … 5000 pts = 50,000 د.ع (grand prize, 1 in 250)
     prizes: env(
       'WHEEL_PRIZES',
-      '500 د.ع:50:15|حظ أوفر:0:20|1,000 د.ع:100:10|حظ أوفر:0:18|500 د.ع:50:15|حظ أوفر:0:17|2,000 د.ع:200:4|5,000 د.ع:500:1'
+      '500 د.ع:50:15|حظ أوفر:0:17.2|1,000 د.ع:100:12|حظ أوفر:0:17.2|5,000 د.ع:500:1|500 د.ع:50:15|حظ أوفر:0:17.2|2,000 د.ع:200:5|50,000 د.ع:5000:0.4'
     ),
     // Daily reminder push (Baghdad hour) to those who haven't spun today.
     pushEnabled: bool('WHEEL_PUSH_ENABLED', true),
