@@ -2645,7 +2645,10 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: '_alwaseet_city_id', value: String(order.address.cityId) },
       { key: 'المنطقة', value: order.address.area },
       { key: '_alwaseet_region_id', value: String(order.address.regionId) },
-      ...(order.address.landmark ? [{ key: 'أقرب نقطة دالة', value: order.address.landmark }] : [])
+      // The Al-Waseet upload reads the landmark from the English key "landmark" (Arabic value).
+      ...(order.address.landmark
+        ? [{ key: 'landmark', value: order.address.landmark }, { key: 'أقرب نقطة دالة', value: order.address.landmark }]
+        : [])
     );
   }
   const consent = state.consent?.[order.customer.phone];
