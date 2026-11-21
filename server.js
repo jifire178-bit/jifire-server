@@ -4279,7 +4279,7 @@ if (require.main === module || process.env.OWNER_INTERVAL_MS) {
 }
 
 const ADMIN_GROUPS = [
-  { id: 'app', title: 'التطبيق والتحديثات', icon: '📲', test: (k) => k.startsWith('APP_'),
+  { id: 'app', title: 'التطبيق والتحديثات', icon: '📲', test: (k) => k.startsWith('APP_') && k !== 'APP_NOTICE',
     note: 'ثبّت النسخة الجديدة على جوالك وضعها على رابط التحديث أولاً، ثم ارفع ملف الخادم.' },
   { id: 'features', title: 'مفاتيح التشغيل والطوارئ', icon: '🎛️',
     test: (k) => k.startsWith('FEATURE_') || /^(ORDERS_PAUSED|ORDERS_PAUSED_MESSAGE|APP_NOTICE|PIN_ENABLED)$/.test(k),
