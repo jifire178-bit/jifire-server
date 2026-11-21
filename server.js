@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.8.3';
+const APP_RELEASE = '3.8.4';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -85,10 +85,11 @@ const CFG = {
   // WHEEL_PRIZES = "label:points:chance%|…" — one entry per slice of the wheel.
   wheel: {
     enabled: bool('WHEEL_ENABLED', true),
-    everyDays: num('WHEEL_EVERY_DAYS', 7),
+    everyDays: num('WHEEL_EVERY_DAYS', 1),
+    // 1 point = 10 IQD: 50 pts = 500 د.ع, 100 = 1,000, 200 = 2,000, 500 = 5,000
     prizes: env(
       'WHEEL_PRIZES',
-      '5 نقاط:5:15|حظ أوفر:0:25|10 نقاط:10:8|حظ أوفر:0:25|25 نقطة:25:3|حظ أوفر:0:22.5|50 نقطة:50:1|500 نقطة:500:0.5'
+      '500 د.ع:50:15|حظ أوفر:0:20|1,000 د.ع:100:10|حظ أوفر:0:18|500 د.ع:50:15|حظ أوفر:0:17|2,000 د.ع:200:4|5,000 د.ع:500:1'
     ),
   },
   port: Number(env('PORT', '8080')),
@@ -1811,9 +1812,13 @@ function wheelPrizes() {
   return out.slice(0, 12);
 }
 
+// A new spin from midnight (Baghdad time) N days after the last one.
+const BAGHDAD_MS = 3 * 3600e3;
 function wheelNext(ledger) {
   const last = Date.parse(ledger.wheel?.last || '');
-  return last ? new Date(last + CFG.wheel.everyDays * 86400e3).toISOString() : null;
+  if (!last) return null;
+  const dayStart = Math.floor((last + BAGHDAD_MS) / 86400e3) * 86400e3 - BAGHDAD_MS;
+  return new Date(dayStart + Math.max(1, Math.round(CFG.wheel.everyDays)) * 86400e3).toISOString();
 }
 
 function wheelPublic(ledger) {
@@ -1822,7 +1827,7 @@ function wheelPublic(ledger) {
   const total = prizes.reduce((a, x) => a + x.weight, 0);
   return {
     enabled: CFG.wheel.enabled && LOY.enabled && prizes.length >= 2 && total > 0,
-    slices: prizes.map((x) => ({ label: x.label, points: x.points })),
+    slices: prizes.map((x) => ({ label: x.label, points: x.points, value: x.points * LOY.pointValue })),
     everyDays: CFG.wheel.everyDays,
     canSpin: !next || Date.parse(next) <= Date.now(),
     nextAt: next && Date.parse(next) > Date.now() ? next : null,
@@ -1878,7 +1883,14 @@ async function spinWheel(phone) {
     }
     saveState();
     log('wheel', phone.slice(-4), prize.points);
-    return { index, label: prize.label, points: prize.points, balance: ledgerBalance(ledger), ...wheelPublic(ledger) };
+    return {
+      index,
+      label: prize.label,
+      points: prize.points,
+      value: prize.points * LOY.pointValue,
+      balance: ledgerBalance(ledger),
+      ...wheelPublic(ledger),
+    };
   });
 }
 
@@ -3566,7 +3578,7 @@ const ADMIN_GROUPS = [
     note: 'ثبّت النسخة الجديدة على جوالك وضعها على رابط التحديث أولاً، ثم ارفع ملف الخادم.' },
   { id: 'loyalty', title: 'النقاط والدعوة', icon: '⭐', test: (k) => k.startsWith('LOYALTY_') },
   { id: 'wheel', title: 'عجلة الحظ', icon: '🎡', test: (k) => k.startsWith('WHEEL_'),
-    note: 'كل سطر = خانة بالعجلة: الاسم:النقاط:نسبة الفوز%. مجموع النسب يفضّل يكون 100. النقاط 0 = حظ أوفر.' },
+    note: 'كل سطر = خانة بالعجلة: الاسم:النقاط:نسبة الفوز%. النقطة = 10 د.ع (50 نقطة = 500 د.ع). مجموع النسب يفضّل يكون 100. النقاط 0 = حظ أوفر.' },
   { id: 'tiers', title: 'مستويات الزبائن', icon: '👑', test: (k) => k.startsWith('TIER'),
     note: 'المستوى يُحسب من مجموع مشتريات الزبون المستلمة (كل طلباته السابقة). المضاعف يزيد نقاط كل طلب.' },
   { id: 'messages', title: 'الرسائل والإشعارات', icon: '🔔', test: (k) => k.startsWith('MSG_') || k === 'REVIEW_ASK_HOURS',
@@ -3598,7 +3610,7 @@ const ADMIN_META = {
   LOYALTY_FRIEND_POINTS: ['هدية الصديق المدعو (نقطة)', 'بعد توصيل أول طلب له'],
   LOYALTY_REFERRAL_MONTHLY_CAP: ['أقصى دعوات مكافأة بالشهر', 'لكل زبون (ضد التحايل)'],
   WHEEL_ENABLED: ['تفعيل عجلة الحظ', 'تظهر للزبائن المسجّلين'],
-  WHEEL_EVERY_DAYS: ['لفة وحدة كل كم يوم', '7 = مرة بالأسبوع'],
+  WHEEL_EVERY_DAYS: ['لفة وحدة كل كم يوم', '1 = كل يوم (تتجدد 12 بالليل بتوقيت بغداد)، 7 = مرة بالأسبوع'],
   WHEEL_PRIZES: ['خانات العجلة والجوائز', 'كل خانة بسطر: الاسم:النقاط:النسبة%'],
   TIERS_ENABLED: ['تفعيل المستويات', 'برونزي / فضي / ذهبي / VIP'],
   TIER_SILVER_MIN: ['🥈 فضي — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
