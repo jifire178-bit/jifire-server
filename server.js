@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.14';
+const APP_RELEASE = '3.9.15';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -2519,6 +2519,7 @@ const WASEET_MAP = [
   [/فرز|مخزن|في الطريق/, 'transit', 3, 'ok', 'طلبك بالطريق لمحافظتك 🚛', true],
   [/مكتب المحافظة|في مكتب/, 'office', 3, 'ok', 'وصل طلبك لمكتب التوصيل بمحافظتك', true],
   [/استلام|المندوب/, 'picked', 3, 'ok', 'طلبك خرج للتوصيل، وسلّمناه لشركة الشحن 🚚', false], // the "shipped" push already says it
+  [/معطل|غير فعال|متوقف/, 'disabled', 3, 'warn', 'طلبك متوقف مؤقتاً لدى شركة التوصيل، وراح نتواصل وياك', true],
   [/فعال|جديد|قيد المعالجة/, 'active', 2, 'ok', 'تم تجهيز طلبك، وراح يستلمه مندوب شركة الشحن قريباً 📦', false],
 ];
 function waseetClassify(text) {
@@ -2550,17 +2551,57 @@ function waseetTimeline(orderId) {
   });
 }
 
+// Store status tags set by hand in Shopify ("osp: خرج للتوصيل"...). Several
+// may be ticked at once: the most advanced one counts.
+const OSP_MAP = [
+  [/تم التسليم|تسليم الطلب|واصل/, 'delivered', 7],
+  [/الغاء|إلغاء|ملغي|ملغى|ألغ/, 'cancelled', 0],
+  [/راجع|مرتجع|ارجاع|إرجاع/, 'returned', 0],
+  [/مؤجل|تأجيل|تاجيل/, 'postponed', -1],
+  [/عند المندوب|قيد التوصيل|عهدة/, 'out', 6],
+  [/مكتب المحافظة|مكتب/, 'office', 5],
+  [/في الطريق|بالطريق/, 'transit', 4],
+  [/خرج للتوصيل|شركة الشحن|تم الشحن|شحن/, 'picked', 3],
+  [/تجهيز|جاهز/, 'prepared', 2],
+  [/استلام الطلب|تأكيد|مؤكد/, 'received', 1],
+];
+function ospInfo(tagList) {
+  const texts = (tagList || []).filter((t) => /^osp\s*:/i.test(String(t))).map((t) => String(t).replace(/^osp\s*:\s*/i, '').trim());
+  let best = null;
+  let hold = null;
+  for (const text of texts) {
+    const m = OSP_MAP.find(([re]) => re.test(text));
+    if (!m) continue; // payment notes etc.
+    const [, kind, stage] = m;
+    if (kind === 'postponed') { hold = { kind, text }; continue; }
+    const rank = kind === 'delivered' ? 9 : stage === 0 ? 8 : stage;
+    if (!best || rank > best.rank) best = { kind, stage, text, rank };
+  }
+  if (!best && !hold) return null;
+  return { ...(best || { kind: 'postponed', stage: 0, text: hold.text }), hold };
+}
+
 function orderStep(o) {
   const w = waseetInfo(o.tags);
-  if (w && !o.cancelledAt) {
+  const osp0 = ospInfo(o.tags);
+  if (w && !o.cancelledAt && !(osp0 && ['delivered', 'cancelled', 'returned'].includes(osp0.kind))) {
     if (w.kind === 'delivered') return { step: 4, status: 'delivered', at: null, waseet: w };
     if (w.kind === 'returned') return { step: 0, status: 'returned', at: null, waseet: w };
     if (w.kind === 'cancelled') return { step: 0, status: 'cancelled', at: null, waseet: w };
-    return { step: w.step, status: w.step === 2 ? 'preparing' : 'shipped', at: null, waseet: w };
+    const step = Math.max(w.step, osp0 && osp0.stage >= 3 ? 3 : 0);
+    return { step, status: step === 2 ? 'preparing' : 'shipped', at: null, waseet: w, osp: osp0 };
   }
-  const tags = (o.tags || []).filter((t) => !/^waseet\s*:/i.test(String(t))).join(' ');
+  const osp = osp0;
   const f = o.fulfillments || [];
-  if (o.cancelledAt || /إلغاء|ملغي|cancel/i.test(tags)) return { step: 0, status: 'cancelled' };
+  if (o.cancelledAt) return { step: 0, status: 'cancelled' };
+  if (osp?.kind === 'delivered') return { step: 4, status: 'delivered', at: f.find((x) => x.deliveredAt)?.deliveredAt || null, osp };
+  if (osp?.kind === 'cancelled') return { step: 0, status: 'cancelled', osp };
+  if (osp?.kind === 'returned') return { step: 0, status: 'returned', osp };
+  if (osp && osp.stage >= 3) return { step: 3, status: 'shipped', at: f[0]?.createdAt || null, osp };
+  if (osp?.stage === 2) return { step: 2, status: 'preparing', osp };
+  // Without a store status tag, plain tags still count (older manual workflow).
+  const tags = osp ? '' : (o.tags || []).filter((t) => !/^waseet\s*:/i.test(String(t))).join(' ');
+  if (/إلغاء|ملغي|cancel/i.test(tags)) return { step: 0, status: 'cancelled' };
   const delivered = f.find((x) => x.deliveredAt);
   if (delivered || /تم التوصيل|تم التسليم|واصل|delivered/i.test(tags)) {
     return { step: 4, status: 'delivered', at: delivered?.deliveredAt || null };
@@ -2590,7 +2631,7 @@ function orderStep(o) {
 // 0 = cancelled / returned. Postponed, closed phone… keep the stage reached
 // and are reported as `hold`. Pickup orders use 1 → 2 → 7.
 const STAGE_OF_KIND = { active: 2, handed: 2, picked: 3, transit: 4, office: 5, out: 6, delivered: 7 };
-const HOLD_KINDS = new Set(['postponed', 'closed', 'noanswer', 'notice', 'other']);
+const HOLD_KINDS = new Set(['postponed', 'closed', 'noanswer', 'notice', 'disabled', 'other']);
 function orderStage(o, st) {
   st = st || orderStep(o);
   const pickup = (o.tags || []).some((t) => String(t).includes('استلام من المتجر'));
@@ -2613,11 +2654,15 @@ function orderStage(o, st) {
   if (st.step === 4) stage = 7;
   else if (w && STAGE_OF_KIND[w.kind]) stage = STAGE_OF_KIND[w.kind];
   else if (w && HOLD_KINDS.has(w.kind)) {
-    stage = Math.max(reached, 6);
+    stage = Math.max(reached, w.kind === 'disabled' ? 2 : 6);
     hold = { kind: w.kind, text: w.text };
   } else if (st.step === 3) stage = pickup ? 7 : 3;
   else if (st.step === 2) stage = 2;
   else stage = 1;
+  if (st.osp && stage < 7) {
+    if (st.osp.stage > 0) stage = Math.max(stage, st.osp.stage);
+    if (st.osp.hold && !hold) hold = { kind: 'postponed', text: st.osp.hold.text };
+  }
   stage = Math.max(stage, Math.min(reached, 6));
   if (pickup && stage > 2 && stage < 7) stage = 2;
   if (stage === 7 && !times[7]) times[7] = f?.deliveredAt || st.at || null;
