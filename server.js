@@ -1846,8 +1846,7 @@ async function handleLoyaltyMe(phone) {
 // ------------------------------------------------------ كمّل طلبك ---
 // The app reports "checkout opened". If no order follows within an hour, the
 // customer gets a push with a personal code (e.g. 5,000 IQD, 24 h, one use,
-// only their phone). At most one offer per customer and per device a month,
-// never at night.
+// only their phone). At most one offer per customer and per device a month.
 function checkoutStarted(phone, body) {
   const A = CFG.abandon;
   if (!A.enabled) return { ok: true };
@@ -1874,8 +1873,8 @@ async function checkAbandoned() {
   if (abandonBusy || !A.enabled || !pushEnabled() || !state.checkouts) return;
   const now = Date.now();
   const hour = new Date(now + BAGHDAD_MS).getUTCHours();
-  // Not at night (default 23:00–09:00 Baghdad): wait for the morning.
-  const [qFrom, qTo] = env('ABANDON_QUIET_HOURS', '23-9').split('-').map(Number);
+  // Sent right after the set time, day or night (optional quiet hours: ABANDON_QUIET_HOURS=23-9).
+  const [qFrom, qTo] = env('ABANDON_QUIET_HOURS', '0-0').split('-').map(Number);
   if (qFrom !== qTo && (qFrom > qTo ? hour >= qFrom || hour < qTo : hour >= qFrom && hour < qTo)) return;
   abandonBusy = true;
   try {
@@ -3834,7 +3833,7 @@ const ADMIN_GROUPS = [
     note: 'ثبّت النسخة الجديدة على جوالك وضعها على رابط التحديث أولاً، ثم ارفع ملف الخادم.' },
   { id: 'loyalty', title: 'النقاط والدعوة', icon: '⭐', test: (k) => k.startsWith('LOYALTY_') },
   { id: 'abandon', title: 'كمّل طلبك (خصم للي ما كمّل)', icon: '🎁', test: (k) => k.startsWith('ABANDON_'),
-    note: 'زبون فتح صفحة الدفع وما طلب: يوصله إشعار بكود خصم شخصي، لرقمه فقط، مرة وحدة، ولمدة محدودة. ما يوصل بالليل (من 11 بالليل لـ 9 الصبح).' },
+    note: 'زبون فتح صفحة الدفع وما طلب: يوصله إشعار بكود خصم شخصي، لرقمه فقط، مرة وحدة، ولمدة محدودة. يوصل مباشرة بعد الوقت المحدد، ليلاً أو نهاراً.' },
   { id: 'wheel', title: 'عجلة الحظ', icon: '🎡', test: (k) => k.startsWith('WHEEL_'),
     note: 'كل سطر = خانة بالعجلة: الاسم:النقاط:نسبة الفوز%. النقطة = 10 د.ع (50 نقطة = 500 د.ع). مجموع النسب يفضّل يكون 100. النقاط 0 = حظ أوفر.' },
   { id: 'tiers', title: 'مستويات الزبائن', icon: '👑', test: (k) => k.startsWith('TIER'),
