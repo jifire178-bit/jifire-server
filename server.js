@@ -47,7 +47,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.8.4';
+const APP_RELEASE = '3.8.5';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -91,6 +91,9 @@ const CFG = {
       'WHEEL_PRIZES',
       '500 د.ع:50:15|حظ أوفر:0:20|1,000 د.ع:100:10|حظ أوفر:0:18|500 د.ع:50:15|حظ أوفر:0:17|2,000 د.ع:200:4|5,000 د.ع:500:1'
     ),
+    // Daily reminder push (Baghdad hour) to those who haven't spun today.
+    pushEnabled: bool('WHEEL_PUSH_ENABLED', true),
+    pushHour: num('WHEEL_PUSH_HOUR', 19),
   },
   port: Number(env('PORT', '8080')),
   publicUrl: env('PUBLIC_URL').replace(/\/+$/, ''),
@@ -1873,6 +1876,8 @@ async function spinWheel(phone) {
     const prize = prizes[index];
     const now = new Date().toISOString();
     ledger.wheel = { last: now, prize: prize.points, spins: Number(ledger.wheel?.spins || 0) + 1 };
+    state.wheelSpun = state.wheelSpun || {};
+    state.wheelSpun[phone] = baghdadDay();
     if (prize.points > 0) setEntry(ledger, 'wheel:' + now, prize.points, { t: 'wheel' });
     await saveLedger(id, ledger);
     state.wheelStats = state.wheelStats || { spins: 0, wins: 0, points: 0 };
@@ -1892,6 +1897,63 @@ async function spinWheel(phone) {
       ...wheelPublic(ledger),
     };
   });
+}
+
+const baghdadDay = (t = Date.now()) => new Date(t + BAGHDAD_MS).toISOString().slice(0, 10);
+
+// A different message every day (rotates through the list).
+const WHEEL_PUSH_TEXTS = [
+  ['🎡 لفّتك اليومية جاهزة!', 'جرّب حظك واربح لحد {top} نقاط تنخصم من طلبك.'],
+  ['💰 اجمع نقاط أكثر، وفّر أكثر', 'لفّ عجلة الحظ اليوم وزيد رصيدك مجاناً.'],
+  ['👑 الجائزة الكبرى بانتظارك', '{top} ممكن تكون من نصيبك اليوم. لفّ الآن!'],
+  ['🍀 اليوم يومك؟', 'عندك لفّة مجانية بعجلة جي فاير، لا تفوّتها.'],
+  ['⏳ لفّتك تنتهي الليلة!', 'لفّة اليوم تروح الساعة 12. جرّب حظك قبل لا تفوت.'],
+  ['🎁 هدية يومية من جي فاير', 'لفّة وحدة ممكن تقرّبك من جهازك الجاي بسعر أقل.'],
+  ['🔥 كل لفّة تقرّبك أكثر', 'اجمع نقاطك من العجلة واستبدلها بخصم على أي طلب.'],
+];
+
+let wheelPushBusy = false;
+async function checkWheelPush() {
+  const W = CFG.wheel;
+  if (wheelPushBusy || !W.enabled || !W.pushEnabled || !LOY.enabled || !pushEnabled()) return;
+  const now = Date.now();
+  const day = baghdadDay(now);
+  const hour = new Date(now + BAGHDAD_MS).getUTCHours();
+  state.wheelPush = state.wheelPush || {};
+  if (state.wheelPush.day === day || hour < W.pushHour) return;
+  if (hour > W.pushHour + 3) return; // too late tonight (e.g. server restarted at midnight): skip
+  const prizes = wheelPrizes();
+  if (prizes.length < 2) return;
+  wheelPushBusy = true;
+  try {
+    state.wheelPush.day = day; // once a day, even if it fails half way
+    saveState();
+    const top = Math.max(...prizes.map((x) => x.points)) * LOY.pointValue;
+    const n = Math.floor((now + BAGHDAD_MS) / 86400e3) % WHEEL_PUSH_TEXTS.length;
+    const [title, body] = WHEEL_PUSH_TEXTS[n];
+    const msg = { title, body: body.replace('{top}', top.toLocaleString('en-US') + ' د.ع'), data: { link: 'wheel' } };
+    let sent = 0;
+    for (const [ph, devs] of Object.entries(state.push || {})) {
+      if (state.wheelSpun?.[ph] === day) continue; // already spun today
+      for (const dev of [...devs]) {
+        const r = await sendPush(dev.token, msg);
+        if (r === 'ok') sent++;
+        if (r === 'invalid') unregisterPushToken(dev.token);
+      }
+    }
+    // forget old days
+    for (const [ph, d] of Object.entries(state.wheelSpun || {})) if (d !== day) delete state.wheelSpun[ph];
+    state.wheelPush.sent = sent;
+    saveState();
+    log('wheel push', day, sent);
+  } catch (e) {
+    log('wheel push failed', String(e.message || e).slice(0, 200));
+  } finally {
+    wheelPushBusy = false;
+  }
+}
+if (require.main === module || process.env.WHEEL_PUSH_INTERVAL_MS) {
+  setInterval(checkWheelPush, Number(env('WHEEL_PUSH_INTERVAL_MS', '300000'))).unref();
 }
 
 /** A new customer enters a friend's code once, before their first order. */
@@ -3291,6 +3353,8 @@ const EDITABLE = [
   ['WHEEL_ENABLED', 'عجلة الحظ', false],
   ['WHEEL_EVERY_DAYS', 'عجلة الحظ: كل كم يوم', false],
   ['WHEEL_PRIZES', 'عجلة الحظ: الجوائز', false],
+  ['WHEEL_PUSH_ENABLED', 'عجلة الحظ: إشعار يومي', false],
+  ['WHEEL_PUSH_HOUR', 'عجلة الحظ: ساعة الإشعار', false],
   ['TIERS_ENABLED', 'مستويات الزبائن', false],
   ['TIER_SILVER_MIN', 'المستوى الفضي من مبلغ', false],
   ['TIER_GOLD_MIN', 'المستوى الذهبي من مبلغ', false],
@@ -3612,6 +3676,8 @@ const ADMIN_META = {
   WHEEL_ENABLED: ['تفعيل عجلة الحظ', 'تظهر للزبائن المسجّلين'],
   WHEEL_EVERY_DAYS: ['لفة وحدة كل كم يوم', '1 = كل يوم (تتجدد 12 بالليل بتوقيت بغداد)، 7 = مرة بالأسبوع'],
   WHEEL_PRIZES: ['خانات العجلة والجوائز', 'كل خانة بسطر: الاسم:النقاط:النسبة%'],
+  WHEEL_PUSH_ENABLED: ['🔔 إشعار يومي «لفّتك جاهزة»', 'يوصل مرة باليوم للي ما لفّ العجلة، والنص يتغير كل يوم'],
+  WHEEL_PUSH_HOUR: ['🕖 ساعة الإشعار (بتوقيت بغداد)', '19 = السابعة مساءً'],
   TIERS_ENABLED: ['تفعيل المستويات', 'برونزي / فضي / ذهبي / VIP'],
   TIER_SILVER_MIN: ['🥈 فضي — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
   TIER_GOLD_MIN: ['🥇 ذهبي — من مجموع مشتريات (د.ع)', 'كل طلبات الزبون المستلمة، من الموقع والتطبيق'],
@@ -3677,6 +3743,8 @@ function adminDefaults() {
     WHEEL_ENABLED: String(CFG.wheel.enabled),
     WHEEL_EVERY_DAYS: String(CFG.wheel.everyDays),
     WHEEL_PRIZES: CFG.wheel.prizes.split('|').join('\n'),
+    WHEEL_PUSH_ENABLED: String(CFG.wheel.pushEnabled),
+    WHEEL_PUSH_HOUR: String(CFG.wheel.pushHour),
     TIERS_ENABLED: String(TIERS.enabled),
     TIER_SILVER_MIN: String(TIERS.silver),
     TIER_GOLD_MIN: String(TIERS.gold),
@@ -4585,4 +4653,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+module.exports = { checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
