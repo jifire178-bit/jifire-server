@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.4';
+const APP_RELEASE = '3.9.5';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -392,7 +392,7 @@ query Variants($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProductVariant {
       id title sku price availableForSale
-      product { id title status productType }
+      product { id title status productType tags }
     }
   }
 }`;
@@ -503,6 +503,8 @@ async function priceCart(lines) {
       price: Number(v.price),
       productType: v.product.productType,
       addons: l.addons,
+      cardOnly: isCardOnly(v.product.tags),
+      preorder: isPreorder(v.product.tags),
     });
   }
   // Cover / protector services chosen for phones and tablets.
@@ -729,8 +731,37 @@ function orderTotals(order, priced) {
 }
 
 /** Prices the cart and applies the order's discount code, if any. */
+// --------------------------------------------- حجز مسبق / بطاقة فقط ---
+// Shopify product tag «حجز مسبق» (or preorder) or «بطاقة فقط» (card-only):
+// the order can only be paid by card (HyperPay); no cash on delivery, no
+// installments, no points.
+const isPreorder = (tags) => (tags || []).some((t) => /حجز|pre-?order/i.test(t));
+const isCardOnly = (tags) => isPreorder(tags) || (tags || []).some((t) => /بطاقة فقط|card-?only/i.test(t));
+function checkPaymentAllowed(order, priced) {
+  const only = priced.items.filter((i) => i.cardOnly);
+  if (only.length && order.payment && order.payment !== 'card') {
+    throw new AppError(400, `«${only[0].title}» ${only[0].preorder ? 'حجز مسبق، ' : ''}الدفع له بالبطاقة فقط`);
+  }
+}
+
+/** Checkout asks which payment methods this cart allows. */
+async function handleCartRules(body) {
+  const lines = Array.isArray(body?.lines) ? body.lines.slice(0, 50) : [];
+  const ids = [...new Set(lines.map((l) => String(l?.variantId || '')).filter((x) => /^gid:\/\/shopify\/ProductVariant\/\d+$/.test(x)))];
+  if (!ids.length) return { cardOnly: false, products: [] };
+  const data = await admin(VARIANTS_QUERY, { ids });
+  const only = (data.nodes || []).filter((v) => v && isCardOnly(v.product?.tags));
+  return {
+    cardOnly: only.length > 0,
+    preorder: only.some((v) => isPreorder(v.product.tags)),
+    products: [...new Set(only.map((v) => v.product.title))],
+    cardEnabled: hyperpayEnabled(),
+  };
+}
+
 async function priceOrder(order) {
   const priced = await priceCart(order.lines);
+  checkPaymentAllowed(order, priced);
   if (order.discountCode) priced.discount = await evaluateDiscount(order.discountCode, priced, order);
   return priced;
 }
@@ -2246,6 +2277,7 @@ async function placeOrderWithPoints(order) {
     const { ledger } = await loadLedger(cid);
     const balance = redeemableBalance(ledger);
     const priced = await priceCart(order.lines);
+    checkPaymentAllowed(order, priced);
     const maxPts = Math.floor((priced.subtotal * LOY.maxRedeemPct) / 100 / LOY.pointValue);
     const points = Math.min(balance, maxPts);
     if (balance < LOY.minRedeem || points <= 0) {
@@ -2465,10 +2497,73 @@ async function handleMyOrders(phone) {
         step: st.step,
         status: st.status,
         statusAt: st.at || null,
+        canCancel: canCustomerCancel(o),
+        cancelUntil: new Date(Date.parse(o.createdAt) + cancelWindowMs()).toISOString(),
         items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
       };
     }),
   };
+}
+
+// ------------------------------------------- إلغاء الطلب من الزبون ---
+// Within CANCEL_MINUTES (default 10) of placing it, if nothing was prepared or
+// shipped and nothing was paid online (card/installments go through support).
+const CANCEL_ORDER_QUERY = `
+query CancelCheck($id: ID!) {
+  order(id: $id) {
+    id name createdAt cancelledAt tags displayFulfillmentStatus displayFinancialStatus
+    customer { id }
+    fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
+  }
+}`;
+
+function cancelWindowMs() {
+  return Math.max(0, num('CANCEL_MINUTES', 10)) * 60e3;
+}
+
+/** Can the customer still cancel this order (for the app's button). */
+function canCustomerCancel(o) {
+  if (!o || o.cancelledAt) return false;
+  if (Date.now() - Date.parse(o.createdAt) > cancelWindowMs()) return false;
+  if (o.displayFulfillmentStatus && o.displayFulfillmentStatus !== 'UNFULFILLED') return false;
+  if (!['PENDING', 'AUTHORIZED', 'EXPIRED'].includes(o.displayFinancialStatus || 'PENDING')) return false;
+  return orderStep(o).step <= 1;
+}
+
+async function customerCancelOrder(phone, body) {
+  const id = String(body?.id || '');
+  if (!/^gid:\/\/shopify\/Order\/\d+$/.test(id)) throw new AppError(400, 'طلب غير صحيح');
+  const c = await customerByPhone(phone);
+  const d = await admin(CANCEL_ORDER_QUERY, { id });
+  const o = d.order;
+  if (!o || !c || o.customer?.id !== c.id) throw new AppError(404, 'الطلب غير موجود');
+  if (o.cancelledAt) throw new AppError(400, 'الطلب ملغي مسبقاً');
+  if (!['PENDING', 'AUTHORIZED', 'EXPIRED'].includes(o.displayFinancialStatus || 'PENDING')) {
+    throw new AppError(400, 'الطلبات المدفوعة بالبطاقة أو الأقساط تُلغى عبر التواصل معنا');
+  }
+  if (!canCustomerCancel(o)) {
+    throw new AppError(400, `انتهت مدة الإلغاء (${Math.round(cancelWindowMs() / 60e3)} دقائق) أو بدأ تجهيز الطلب. تواصل معنا`);
+  }
+  const r = await admin(
+    `mutation C($id: ID!, $note: String) {
+      orderCancel(orderId: $id, reason: CUSTOMER, restock: true, notifyCustomer: false, staffNote: $note) {
+        job { id }
+        orderCancelUserErrors { message }
+      }
+    }`,
+    { id, note: 'ألغاه الزبون من التطبيق' }
+  );
+  const errs = r.orderCancel?.orderCancelUserErrors || [];
+  if (errs.length) {
+    log('customer cancel failed', o.name, JSON.stringify(errs).slice(0, 300));
+    throw new AppError(400, 'تعذّر إلغاء الطلب، تواصل معنا');
+  }
+  await admin(`mutation T($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`, {
+    id,
+    tags: ['ألغاه الزبون من التطبيق'],
+  }).catch(() => {});
+  log('customer cancelled', o.name, phone.slice(-4));
+  return { ok: true, name: o.name };
 }
 
 const PAYMENT_LABEL = {
@@ -3640,6 +3735,7 @@ const EDITABLE = [
   ['LOYALTY_FRIEND_POINTS', 'النقاط: هدية الصديق المدعو', false],
   ['LOYALTY_REFERRAL_MONTHLY_CAP', 'النقاط: أقصى عدد دعوات مكافأة بالشهر للشخص', false],
   ['REVIEW_ASK_HOURS', 'إشعار «قيّم منتجك»: بعد كم ساعة من التسليم (0 = مباشرة)', false],
+  ['CANCEL_MINUTES', 'إلغاء الطلب من الزبون (دقائق)', false],
   ['ABANDON_ENABLED', 'كمّل طلبك', false],
   ['ABANDON_AMOUNT', 'كمّل طلبك: مبلغ الخصم', false],
   ['ABANDON_AFTER_MIN', 'كمّل طلبك: بعد كم دقيقة', false],
@@ -3945,7 +4041,7 @@ const ADMIN_GROUPS = [
     note: 'المستوى يُحسب من مجموع مشتريات الزبون المستلمة (كل طلباته السابقة). المضاعف يزيد نقاط كل طلب.' },
   { id: 'messages', title: 'الرسائل والإشعارات', icon: '🔔', test: (k) => k.startsWith('MSG_') || k === 'REVIEW_ASK_HOURS',
     note: 'اكتب {order} مكان رقم الطلب.' },
-  { id: 'delivery', title: 'التوصيل والاستلام', icon: '🚚', test: (k) => /^(DELIVERY_|FREE_DELIVERY|PICKUP_|COD_)/.test(k) },
+  { id: 'delivery', title: 'التوصيل والاستلام', icon: '🚚', test: (k) => /^(DELIVERY_|FREE_DELIVERY|PICKUP_|COD_|CANCEL_)/.test(k) },
   { id: 'otp', title: 'رمز الدخول (MSG91)', icon: '🔐', test: (k) => /^(MSG91_|OTP_)/.test(k),
     note: 'إرسال رمز التحقق عبر SMS وواتساب.' },
   { id: 'hyperpay', title: 'الدفع بالبطاقة (HyperPay)', icon: '💳', test: (k) => k.startsWith('HYPERPAY_') },
@@ -3971,6 +4067,7 @@ const ADMIN_META = {
   LOYALTY_REFERRER_POINTS: ['مكافأة صاحب الدعوة (نقطة)', 'بعد توصيل أول طلب للصديق'],
   LOYALTY_FRIEND_POINTS: ['هدية الصديق المدعو (نقطة)', 'بعد توصيل أول طلب له'],
   LOYALTY_REFERRAL_MONTHLY_CAP: ['أقصى دعوات مكافأة بالشهر', 'لكل زبون (ضد التحايل)'],
+  CANCEL_MINUTES: ['⏱️ الزبون يگدر يلغي طلبه خلال (دقيقة)', 'من التطبيق، قبل التجهيز، وللدفع عند الاستلام فقط. 0 = بدون إلغاء'],
   ABANDON_ENABLED: ['تفعيل «كمّل طلبك»', ''],
   ABANDON_AMOUNT: ['مبلغ الخصم (د.ع)', ''],
   ABANDON_AFTER_MIN: ['يوصل الإشعار بعد (دقيقة)', 'من آخر مرة فتح صفحة الدفع'],
@@ -4044,6 +4141,7 @@ function adminDefaults() {
     LOYALTY_REFERRER_POINTS: String(LOY.referrer),
     LOYALTY_FRIEND_POINTS: String(LOY.friend),
     LOYALTY_REFERRAL_MONTHLY_CAP: String(LOY.referralMonthlyCap),
+    CANCEL_MINUTES: String(num('CANCEL_MINUTES', 10)),
     ABANDON_ENABLED: String(CFG.abandon.enabled),
     ABANDON_AMOUNT: String(CFG.abandon.amount),
     ABANDON_AFTER_MIN: String(CFG.abandon.afterMin),
@@ -4990,6 +5088,22 @@ async function handleRequest(req, res) {
         body = JSON.parse(await readBody(req, 16384));
       } catch {}
       return send(res, 200, recordCrash(body));
+    }
+
+    if (req.method === 'POST' && p === '/api/cart/rules') {
+      checkAppKey(req);
+      rateLimit(clientIp(req), 'cart-rules', 120, 10 * 60e3);
+      return send(res, 200, await handleCartRules(JSON.parse(await readBody(req, 16384))));
+    }
+
+    if (req.method === 'POST' && p === '/api/orders/cancel') {
+      checkAppKey(req);
+      const phone = readSession(req);
+      if (!phone) throw new AppError(401, 'انتهت الجلسة، سجّل الدخول مجدداً');
+      rateLimit(phone, 'order-cancel', 6, 60 * 60e3);
+      const r = await customerCancelOrder(phone, JSON.parse(await readBody(req, 2048)));
+      if (state.myOrdersCache) delete state.myOrdersCache[phone];
+      return send(res, 200, r);
     }
 
     if (req.method === 'POST' && p === '/api/checkout/started') {
