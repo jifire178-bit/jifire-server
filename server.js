@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.10';
+const APP_RELEASE = '3.9.11';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -1456,7 +1456,30 @@ async function checkFulfilledOrders() {
     for (const o of data.orders?.nodes || []) {
       if (o.updatedAt > newest) newest = o.updatedAt;
       const st = orderStep(o);
-      if (!ORDER_TEXT[st.status] || o.updatedAt < since) continue;
+      if (o.updatedAt < since) continue;
+      // Every Al-Waseet move the customer should know about (postponed, phone off, with the driver...).
+      if (st.waseet?.push && !o.cancelledAt) {
+        const wk = `${o.id}:w:${st.waseet.text}`;
+        if (!op.done[wk]) {
+          op.done[wk] = Date.now();
+          const wPhones = new Set(
+            [o.phone, o.customer?.defaultPhoneNumber?.phoneNumber, o.shippingAddress?.phone].map(normalizePhone).filter(Boolean)
+          );
+          for (const ph of wPhones) {
+            for (const dev of [...(state.push[ph] || [])]) {
+              const r = await sendPush(dev.token, {
+                title: `تحديث توصيل طلبك ${o.name} 🚚`,
+                body: st.waseet.msg,
+                dataOnly: true,
+                data: { type: 'order', status: st.status, step: st.step, order: o.name, delivery: st.waseet.msg },
+              });
+              if (r === 'invalid') unregisterPushToken(dev.token);
+              log('waseet push', o.name, st.waseet.kind, ph.slice(-4), r);
+            }
+          }
+        }
+      }
+      if (!ORDER_TEXT[st.status]) continue;
       // One push per order per status (older state used the bare id for "shipped").
       const key = `${o.id}:${st.status}`;
       if (op.done[key] || (st.status === 'shipped' && op.done[o.id])) continue;
@@ -2478,8 +2501,34 @@ query MyOrders($q: String!) {
   }
 }`;
 
+// Al-Waseet status: the delivery system tags the order "waseet: <status>"
+// (Arabic text from Al-Waseet) every time the shipment moves.
+const WASEET_MAP = [
+  // [pattern, kind, step, message for the customer, push?]
+  [/تم التسليم (?:الى|إلى|ل)?\s*(?:ال)?زبون|تسليم للزبون|تم التسليم بنجاح|واصل|مستلم/, 'delivered', 4, 'تم تسليم طلبك بنجاح ✅', false],
+  [/راجع|ارجاع|إرجاع|مرتجع|رفض|ملغي|الغاء|إلغاء/, 'returning', 3, 'طلبك راجع للمتجر. إذا تريده، تواصل ويانا ونرجع نرسله', true],
+  [/مؤجل|تأجيل|تاجيل/, 'postponed', 3, 'تأجل توصيل طلبك لموعد ثاني، ونعتذر عن التأخير', true],
+  [/مغلق|لا يرد|لايرد|خارج (?:نطاق )?الخدمة|عدم الرد/, 'unreachable', 3, 'حاول مندوب التوصيل يتصل بيك وجوالك مغلق أو ما يرد. خلي جوالك متاح حتى يوصلك طلبك', true],
+  [/عهدة المندوب|قيد التوصيل|مع المندوب|في الطريق (?:الى|إلى) الزبون/, 'out', 3, 'طلبك عند مندوب التوصيل وراح يوصلك قريباً. خلي جوالك قريب منك', true],
+  [/فرز|مخزن|مكتب|في الطريق/, 'transit', 3, 'طلبك بالطريق لمحافظتك 🚛', true],
+  [/استلام|المندوب/, 'picked', 3, 'استلم المندوب طلبك وبدأ شحنه 🚚', false], // the "shipped" push already says it
+  [/فعال|جديد|قيد المعالجة/, 'active', 2, 'تم تأكيد طلبك وجاري تجهيزه للشحن 📦', false],
+];
+function waseetInfo(tagList) {
+  const tag = [...(tagList || [])].reverse().find((t) => /^waseet\s*:/i.test(String(t)));
+  if (!tag) return null;
+  const text = String(tag).replace(/^waseet\s*:\s*/i, '').trim();
+  for (const [re, kind, step, msg, push] of WASEET_MAP) if (re.test(text)) return { text, kind, step, msg, push };
+  return { text, kind: 'other', step: 3, msg: `حالة التوصيل: ${text}`, push: true };
+}
+
 function orderStep(o) {
-  const tags = (o.tags || []).join(' ');
+  const w = waseetInfo(o.tags);
+  if (w && !o.cancelledAt) {
+    if (w.kind === 'delivered') return { step: 4, status: 'delivered', at: null, waseet: w };
+    return { step: w.step, status: w.step === 2 ? 'preparing' : 'shipped', at: null, waseet: w };
+  }
+  const tags = (o.tags || []).filter((t) => !/^waseet\s*:/i.test(String(t))).join(' ');
   const f = o.fulfillments || [];
   if (o.cancelledAt || /إلغاء|ملغي|cancel/i.test(tags)) return { step: 0, status: 'cancelled' };
   const delivered = f.find((x) => x.deliveredAt);
@@ -2511,6 +2560,7 @@ async function handleMyOrders(phone) {
         step: st.step,
         status: st.status,
         statusAt: st.at || null,
+        delivery: st.waseet?.msg || '',
         canCancel: canCustomerCancel(o),
         cancelUntil: new Date(Date.parse(o.createdAt) + cancelWindowMs()).toISOString(),
         items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
@@ -5603,4 +5653,4 @@ if (require.main === module) {
 }
 
 module.exports = {
-  appFlags, dailySummary, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+  appFlags, dailySummary, waseetInfo, orderStep, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
