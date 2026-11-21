@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.15';
+const APP_RELEASE = '3.9.16';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -2511,6 +2511,9 @@ const WASEET_MAP = [
   [/تم التسليم (?:الى|إلى|ل)?\s*(?:ال)?زبون|تسليم للزبون|تم التسليم بنجاح|واصل/, 'delivered', 4, 'ok', 'تم تسليم طلبك بنجاح ✅', false],
   [/تم الارجاع|تم الإرجاع|ارجاع الى التاجر|إرجاع إلى التاجر|قيد الارجاع|قيد الإرجاع|مرتجع|راجع/, 'returned', 0, 'bad', 'طلبك راجع للمتجر. إذا تريده، تواصل ويانا ونرجع نرسله', true],
   [/ملغي|ملغى|الغاء|إلغاء|رفض/, 'cancelled', 0, 'bad', 'شركة التوصيل سجّلت الطلب كملغي. إذا ما طلبت الإلغاء، تواصل ويانا', false],
+  [/معطل|غير فعال|غير معرف|غير داخل في الخدمة|لا يمكن الاتصال|مفصول/, 'badphone', 3, 'warn', 'المندوب ما گدر يتصل برقمك (معطل أو غير فعال). تواصل ويانا حتى نحدّث رقمك ويوصلك طلبك', true],
+  [/العنوان|عنوان/, 'address', 3, 'warn', 'المندوب يحتاج يتأكد من عنوانك، وراح يتصل بيك. خلي جوالك قريب منك', true],
+  [/لم يطلب|طلب مكرر|مستلم مسبق|حظر/, 'refused', 3, 'bad', 'شركة التوصيل سجّلت ملاحظة على طلبك. إذا تريد الطلب تواصل ويانا', true],
   [/مؤجل|تأجيل|تاجيل/, 'postponed', 3, 'warn', 'تأجل توصيل طلبك لليوم الثاني، ونعتذر عن التأخير', true],
   [/مغلق|خارج (?:نطاق )?الخدمة/, 'closed', 3, 'warn', 'حاول المندوب يتصل بيك وجوالك مغلق. خلي جوالك متاح حتى يوصلك طلبك', true],
   [/لا يرد|لايرد|عدم الرد|لا يجيب/, 'noanswer', 3, 'warn', 'حاول المندوب يتصل بيك وما رديت. خلي جوالك قريب منك', true],
@@ -2519,7 +2522,6 @@ const WASEET_MAP = [
   [/فرز|مخزن|في الطريق/, 'transit', 3, 'ok', 'طلبك بالطريق لمحافظتك 🚛', true],
   [/مكتب المحافظة|في مكتب/, 'office', 3, 'ok', 'وصل طلبك لمكتب التوصيل بمحافظتك', true],
   [/استلام|المندوب/, 'picked', 3, 'ok', 'طلبك خرج للتوصيل، وسلّمناه لشركة الشحن 🚚', false], // the "shipped" push already says it
-  [/معطل|غير فعال|متوقف/, 'disabled', 3, 'warn', 'طلبك متوقف مؤقتاً لدى شركة التوصيل، وراح نتواصل وياك', true],
   [/فعال|جديد|قيد المعالجة/, 'active', 2, 'ok', 'تم تجهيز طلبك، وراح يستلمه مندوب شركة الشحن قريباً 📦', false],
 ];
 function waseetClassify(text) {
@@ -2631,7 +2633,8 @@ function orderStep(o) {
 // 0 = cancelled / returned. Postponed, closed phone… keep the stage reached
 // and are reported as `hold`. Pickup orders use 1 → 2 → 7.
 const STAGE_OF_KIND = { active: 2, handed: 2, picked: 3, transit: 4, office: 5, out: 6, delivered: 7 };
-const HOLD_KINDS = new Set(['postponed', 'closed', 'noanswer', 'notice', 'disabled', 'other']);
+const HOLD_KINDS = new Set(['postponed', 'closed', 'noanswer', 'notice', 'badphone', 'address', 'refused', 'other']);
+const HOLD_LABEL = { postponed: 'مؤجل', closed: 'الجوال مغلق', noanswer: 'لا يرد', notice: 'تبليغ', badphone: 'الرقم معطل', address: 'تأكيد العنوان', refused: 'ملاحظة' };
 function orderStage(o, st) {
   st = st || orderStep(o);
   const pickup = (o.tags || []).some((t) => String(t).includes('استلام من المتجر'));
@@ -2654,14 +2657,14 @@ function orderStage(o, st) {
   if (st.step === 4) stage = 7;
   else if (w && STAGE_OF_KIND[w.kind]) stage = STAGE_OF_KIND[w.kind];
   else if (w && HOLD_KINDS.has(w.kind)) {
-    stage = Math.max(reached, w.kind === 'disabled' ? 2 : 6);
-    hold = { kind: w.kind, text: w.text };
+    stage = Math.max(reached, 6);
+    hold = { kind: w.kind, text: w.text, label: HOLD_LABEL[w.kind] || w.text };
   } else if (st.step === 3) stage = pickup ? 7 : 3;
   else if (st.step === 2) stage = 2;
   else stage = 1;
   if (st.osp && stage < 7) {
     if (st.osp.stage > 0) stage = Math.max(stage, st.osp.stage);
-    if (st.osp.hold && !hold) hold = { kind: 'postponed', text: st.osp.hold.text };
+    if (st.osp.hold && !hold) hold = { kind: 'postponed', text: st.osp.hold.text, label: 'مؤجل' };
   }
   stage = Math.max(stage, Math.min(reached, 6));
   if (pickup && stage > 2 && stage < 7) stage = 2;
