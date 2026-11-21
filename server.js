@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.8';
+const APP_RELEASE = '3.9.9';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -3810,6 +3810,8 @@ const EDITABLE = [
   ['ORDERS_PAUSED', 'إيقاف الطلبات', false],
   ['ORDERS_PAUSED_MESSAGE', 'رسالة إيقاف الطلبات', false],
   ['APP_NOTICE', 'رسالة أعلى التطبيق', false],
+  ['APP_NOTICE_COLOR', 'لون الرسالة', false],
+  ['APP_NOTICE_MOVING', 'رسالة متحركة', false],
   ['FEATURE_AI', 'المساعد', false],
   ['FEATURE_AI_NUDGE', 'فقاعة المساعد', false],
   ['FEATURE_SMART_HINTS', 'تلميحات المنتج', false],
@@ -4122,6 +4124,9 @@ function appFlags() {
   f.ordersPaused = ordersPaused();
   f.pausedMessage = f.ordersPaused ? PAUSED_MSG() : '';
   f.notice = env('APP_NOTICE', '');
+  const c = env('APP_NOTICE_COLOR', 'أحمر').toLowerCase();
+  f.noticeColor = /ذهب|gold/.test(c) ? 'gold' : /خضر|green/.test(c) ? 'green' : 'red';
+  f.noticeMoving = bool('APP_NOTICE_MOVING', true);
   f.pin = bool('PIN_ENABLED', true);
   return f;
 }
@@ -4279,10 +4284,10 @@ if (require.main === module || process.env.OWNER_INTERVAL_MS) {
 }
 
 const ADMIN_GROUPS = [
-  { id: 'app', title: 'التطبيق والتحديثات', icon: '📲', test: (k) => k.startsWith('APP_') && k !== 'APP_NOTICE',
+  { id: 'app', title: 'التطبيق والتحديثات', icon: '📲', test: (k) => k.startsWith('APP_') && !k.startsWith('APP_NOTICE'),
     note: 'ثبّت النسخة الجديدة على جوالك وضعها على رابط التحديث أولاً، ثم ارفع ملف الخادم.' },
   { id: 'features', title: 'مفاتيح التشغيل والطوارئ', icon: '🎛️',
-    test: (k) => k.startsWith('FEATURE_') || /^(ORDERS_PAUSED|ORDERS_PAUSED_MESSAGE|APP_NOTICE|PIN_ENABLED)$/.test(k),
+    test: (k) => k.startsWith('FEATURE_') || /^(ORDERS_PAUSED|ORDERS_PAUSED_MESSAGE|APP_NOTICE|APP_NOTICE_COLOR|APP_NOTICE_MOVING|PIN_ENABLED)$/.test(k),
     note: 'تطفي أو تشغّل أي ميزة بالتطبيق لكل الزبائن خلال ثوانٍ، بدون تحديث. «إيقاف الطلبات» للطوارئ فقط: التطبيق يبقى يشتغل بس ما يقبل طلب جديد.' },
   { id: 'owner', title: 'تقارير صاحب المتجر', icon: '📊', test: (k) => /^(OWNER_|REPORT_|STOCK_)/.test(k),
     note: 'الإشعارات توصل لتطبيق جي فاير على جوالك، فلازم تكون مسجّل دخول بالتطبيق بنفس الرقم.' },
@@ -4325,6 +4330,8 @@ const ADMIN_META = {
   ORDERS_PAUSED: ['⛔ إيقاف استقبال الطلبات (طوارئ)', 'مفعّل = التطبيق ما يقبل أي طلب جديد ويطلع للزبون رسالة'],
   ORDERS_PAUSED_MESSAGE: ['رسالة إيقاف الطلبات', 'فارغ = «استقبال الطلبات متوقف مؤقتاً، نرجع قريباً»'],
   APP_NOTICE: ['📢 رسالة تظهر أعلى التطبيق', 'مثل: التوصيل متأخر يومين بسبب العطلة. اكتب - وحفظ حتى تمسحها'],
+  APP_NOTICE_COLOR: ['🎨 لون الرسالة', 'اكتب: أحمر أو ذهبي أو أخضر'],
+  APP_NOTICE_MOVING: ['🏃 الرسالة متحركة', 'مفعّل = النص يتحرك مثل شريط الأخبار'],
   PIN_ENABLED: ['🔒 حماية الاتصال (SSL Pinning)', 'خليه مفعّل. طوارئ: إذا التطبيق كله ما يتصل بالسيرفر، ارفع على GitHub ملف pin.txt بداخله كلمة off'],
   OWNER_PHONES: ['📱 رقم صاحب المتجر', 'رقمك المسجّل بتطبيق جي فاير (تقدر تكتب أكثر من رقم بينهم فاصلة)'],
   REPORT_ENABLED: ['📊 ملخص يومي بإشعار', 'عدد الطلبات والمبيعات وأكثر منتج انطلب'],
@@ -4413,6 +4420,8 @@ function adminDefaults() {
     CANCEL_MINUTES: String(num('CANCEL_MINUTES', 10)),
     ORDERS_PAUSED: 'false',
     PIN_ENABLED: 'true',
+    APP_NOTICE_COLOR: 'أحمر',
+    APP_NOTICE_MOVING: 'true',
     REPORT_ENABLED: 'true',
     REPORT_HOUR: '23',
     STOCK_ALERT_ENABLED: 'true',
@@ -4446,7 +4455,7 @@ function adminFields() {
     const g = ADMIN_GROUPS.find((x) => x.test(k));
     const meta = ADMIN_META[k] || [label.replace(/^النقاط: /, ''), ''];
     const cur = process.env[k] || '';
-    const type = k === 'FIREBASE_SERVICE_ACCOUNT' ? 'file' : /_ENABLED$|^TIER_VIP_FREE_DELIVERY$|^FEATURE_|^ORDERS_PAUSED$/.test(k) ? 'bool' : 'text';
+    const type = k === 'FIREBASE_SERVICE_ACCOUNT' ? 'file' : /_ENABLED$|^TIER_VIP_FREE_DELIVERY$|^FEATURE_|^ORDERS_PAUSED$|^APP_NOTICE_MOVING$/.test(k) ? 'bool' : 'text';
     return {
       key: k,
       group: g ? g.id : 'app',
