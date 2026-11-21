@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.5';
+const APP_RELEASE = '3.9.6';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -504,6 +504,7 @@ async function priceCart(lines) {
       productType: v.product.productType,
       addons: l.addons,
       cardOnly: isCardOnly(v.product.tags),
+      codOnly: isCodOnly(v.product.tags),
       preorder: isPreorder(v.product.tags),
     });
   }
@@ -737,10 +738,19 @@ function orderTotals(order, priced) {
 // installments, no points.
 const isPreorder = (tags) => (tags || []).some((t) => /حجز|pre-?order/i.test(t));
 const isCardOnly = (tags) => isPreorder(tags) || (tags || []).some((t) => /بطاقة فقط|card-?only/i.test(t));
+// Tag «استلام فقط» / «دفع عند الاستلام فقط» / cod-only: cash on delivery only.
+const isCodOnly = (tags) => (tags || []).some((t) => /استلام فقط|cod-?only/i.test(t));
 function checkPaymentAllowed(order, priced) {
-  const only = priced.items.filter((i) => i.cardOnly);
-  if (only.length && order.payment && order.payment !== 'card') {
-    throw new AppError(400, `«${only[0].title}» ${only[0].preorder ? 'حجز مسبق، ' : ''}الدفع له بالبطاقة فقط`);
+  const card = priced.items.filter((i) => i.cardOnly);
+  const cod = priced.items.filter((i) => i.codOnly);
+  if (card.length && cod.length) {
+    throw new AppError(400, `«${card[0].title}» بالبطاقة فقط و«${cod[0].title}» عند الاستلام فقط، اطلبهم بطلبين منفصلين`);
+  }
+  if (card.length && order.payment && order.payment !== 'card') {
+    throw new AppError(400, `«${card[0].title}» ${card[0].preorder ? 'حجز مسبق، ' : ''}الدفع له بالبطاقة فقط`);
+  }
+  if (cod.length && order.payment && order.payment !== 'cod') {
+    throw new AppError(400, `«${cod[0].title}» الدفع له عند الاستلام فقط`);
   }
 }
 
@@ -748,13 +758,17 @@ function checkPaymentAllowed(order, priced) {
 async function handleCartRules(body) {
   const lines = Array.isArray(body?.lines) ? body.lines.slice(0, 50) : [];
   const ids = [...new Set(lines.map((l) => String(l?.variantId || '')).filter((x) => /^gid:\/\/shopify\/ProductVariant\/\d+$/.test(x)))];
-  if (!ids.length) return { cardOnly: false, products: [] };
+  if (!ids.length) return { cardOnly: false, codOnly: false, products: [], codProducts: [] };
   const data = await admin(VARIANTS_QUERY, { ids });
   const only = (data.nodes || []).filter((v) => v && isCardOnly(v.product?.tags));
+  const cod = (data.nodes || []).filter((v) => v && isCodOnly(v.product?.tags));
   return {
     cardOnly: only.length > 0,
+    codOnly: cod.length > 0,
+    conflict: only.length > 0 && cod.length > 0,
     preorder: only.some((v) => isPreorder(v.product.tags)),
     products: [...new Set(only.map((v) => v.product.title))],
+    codProducts: [...new Set(cod.map((v) => v.product.title))],
     cardEnabled: hyperpayEnabled(),
   };
 }
@@ -2713,12 +2727,17 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       }
     }
   } else if (CFG.upsertCustomer) {
+    // Lookup/create failed: upsert by phone only, and keep the email off the
+    // order so Shopify can't attach it to whoever owns that email.
+    if (input.email) {
+      input.customAttributes = [...(input.customAttributes || []), { key: 'البريد الإلكتروني', value: input.email }];
+      input.email = null;
+    }
     input.customer = {
       toUpsert: {
         firstName,
         lastName,
         phone: order.customer.phone,
-        ...(order.customer.email ? { email: order.customer.email } : {}),
         ...(state.consent?.[order.customer.phone]?.wa ? { tags: [WA_TAG] } : {}),
       },
     };
@@ -2989,8 +3008,27 @@ query CustomerByPhone($q: String!) {
   }
 }`;
 
-/** The Shopify customer that owns exactly this phone (search is fuzzy). */
+const CUSTOMER_BY_IDENTIFIER = `
+query CustomerByIdentifier($phone: String!) {
+  customerByIdentifier(identifier: { phoneNumber: $phone }) {
+    id firstName lastName numberOfOrders
+    defaultPhoneNumber { phoneNumber }
+    defaultEmailAddress { emailAddress }
+  }
+}`;
+
+/** The Shopify customer that owns exactly this phone. Exact lookup first
+ *  (no search-index delay, so a customer made a minute ago is found and no
+ *  duplicate is created); the fuzzy search is only a fallback. */
 async function customerByPhone(phone) {
+  if (!phone) return null;
+  try {
+    const d = await admin(CUSTOMER_BY_IDENTIFIER, { phone });
+    const c = d.customerByIdentifier;
+    if (c && c.defaultPhoneNumber?.phoneNumber === phone) return c;
+  } catch (e) {
+    log('customerByIdentifier', String(e.message || e).slice(0, 160));
+  }
   const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
   const hits = (found.customers?.nodes || []).filter((n) => n.defaultPhoneNumber?.phoneNumber === phone);
   // Several with the same number (old duplicates): keep the one with most orders.
@@ -3016,7 +3054,8 @@ async function createCustomerForPhone(phone, name, email) {
     if (id) return id;
     log('customerCreate', JSON.stringify(r.customerCreate?.userErrors).slice(0, 300));
   }
-  return null;
+  // "Phone has already been taken" (two requests at once): use that customer.
+  return (await customerByPhone(phone).catch(() => null))?.id || null;
 }
 const CUSTOMER_CREATE = `
 mutation CustomerCreate($input: CustomerInput!) {
@@ -3046,15 +3085,23 @@ async function handleProfile(phone, body) {
   const lastName = rest.join(' ') || firstName;
   let id = await customerIdByPhone(phone);
   if (!id) {
-    const made = await admin(CUSTOMER_CREATE, {
+    let made = await admin(CUSTOMER_CREATE, {
       input: { phone, firstName, lastName, tags: ['تطبيق جي فاير'], ...(email ? { email } : {}) },
     });
     id = made.customerCreate?.customer?.id;
+    let emailSaved = Boolean(email);
+    if (!id && email) {
+      // the email belongs to another customer: create with the phone only
+      log('profile create (with email)', JSON.stringify(made.customerCreate?.userErrors).slice(0, 300));
+      made = await admin(CUSTOMER_CREATE, { input: { phone, firstName, lastName, tags: ['تطبيق جي فاير'] } });
+      id = made.customerCreate?.customer?.id;
+      emailSaved = false;
+    }
     if (!id) {
       log('profile create', JSON.stringify(made.customerCreate?.userErrors).slice(0, 300));
       throw new AppError(502, 'تعذّر حفظ البيانات في المتجر');
     }
-    return { ok: true, emailSaved: Boolean(email) };
+    return { ok: true, emailSaved };
   }
   let r = await admin(CUSTOMER_UPDATE, { input: { id, firstName, lastName, ...(email ? { email } : {}) } });
   let errs = r.customerUpdate?.userErrors || [];
