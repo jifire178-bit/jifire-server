@@ -91,9 +91,16 @@ WantedBy=multi-user.target
 EOF
 
 # Extra names (e.g. app.jifirephone.com) served next to the main link.
+# Default: app.jifirephone.com. A name is only added when its DNS already
+# points at this server, so a wrong record can never break the main link.
 EXTRA=$(grep '^EXTRA_DOMAINS=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' ' | tr ',' ' ' || true)
+EXTRA=${EXTRA:-${JF_EXTRA_DOMAINS:-app.jifirephone.com}}
 SITES=$DOMAIN
-for d in $EXTRA; do [ -n "$d" ] && [ "$d" != "$DOMAIN" ] && SITES="$SITES, $d"; done
+for d in $EXTRA; do
+  if [ -n "$d" ] && [ "$d" != "$DOMAIN" ] && getent hosts "$d" 2>/dev/null | grep -qw "$IP"; then
+    SITES="$SITES, $d"; echo "Extra link: https://$d"
+  fi
+done
 mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
 $SITES {
