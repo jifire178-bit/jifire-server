@@ -1371,6 +1371,12 @@ async function sendPush(token, { title, body, data = {}, dataOnly = false, image
             ? {}
             : { notification: { channel_id: 'jifire_store', color: '#E2B85A', icon: 'ic_stat_notify', ...(image ? { image } : {}) } }),
         },
+        // iPhone: data-only messages are not shown by iOS, so always send a visible alert.
+        apns: {
+          headers: { 'apns-priority': '10' },
+          payload: { aps: { alert: { title, body }, sound: 'default', 'mutable-content': 1 } },
+          ...(image ? { fcm_options: { image } } : {}),
+        },
       },
     }),
   });
@@ -2476,12 +2482,29 @@ function assetLinks() {
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean);
+  // Google Play build (com.fayez.mobile): the Play app-signing key from Play
+  // Console (APP_PLAY_CERT_SHA256) plus our upload key.
+  const play = env('APP_PLAY_CERT_SHA256', '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .concat('FF:0A:C5:E0:2B:1D:FF:C7:06:F4:85:14:22:60:7E:0D:48:98:90:45:E4:EB:92:2A:88:F5:FE:8B:50:05:04:E7');
   return [
     {
       relation: ['delegate_permission/common.handle_all_urls'],
       target: { namespace: 'android_app', package_name: 'com.jifirephone.jifire_native', sha256_cert_fingerprints: prints },
     },
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: { namespace: 'android_app', package_name: 'com.fayez.mobile', sha256_cert_fingerprints: play },
+    },
   ];
+}
+
+// iPhone universal links (shared product links open the app). APP_IOS_ID = TEAMID.com.fayez.mobile
+function appleAppSiteAssociation() {
+  const id = env('APP_IOS_ID', '');
+  return { applinks: { apps: [], details: id ? [{ appIDs: [id], appID: id, paths: ['/p/*', '/c/*'], components: [{ '/': '/p/*' }, { '/': '/c/*' }] }] : [] } };
 }
 
 // ---------------------------------------------------------- my orders ---
@@ -4009,7 +4032,11 @@ const EDITABLE = [
   ['APP_FORCE_LATEST', 'إجبار أحدث نسخة تلقائياً (true/false)', false],
   ['APP_MIN_VERSION', 'تحديث إجباري: أقل نسخة مسموحة من التطبيق (مثال 3.6.2) — الأقدم منها تُمنع وتظهر لها شاشة التحديث', false],
   ['APP_LATEST_VERSION', 'أحدث نسخة (اختياري): تظهر رسالة «تحديث جديد متوفر» بدون منع', false],
-  ['APP_UPDATE_URL', 'رابط التحديث (Google Play أو رابط التحميل)', false],
+  ['APP_UPDATE_URL', 'رابط التحديث للنسخة المباشرة (رابط التحميل)', false],
+  ['APP_UPDATE_URL_PLAY', 'رابط التحديث لنسخة Google Play', false],
+  ['APP_UPDATE_URL_IOS', 'رابط التحديث لنسخة الآيفون (App Store)', false],
+  ['APP_PLAY_CERT_SHA256', 'بصمة توقيع Google Play (SHA-256 من App signing)', false],
+  ['APP_IOS_ID', 'معرّف تطبيق الآيفون TEAMID.com.fayez.mobile', false],
   ['APP_UPDATE_MESSAGE', 'رسالة شاشة التحديث', false],
   ['LOYALTY_ENABLED', 'نظام النقاط: مفعّل؟ (true / false)', false],
   ['LOYALTY_POINTS_PER_1000', 'النقاط: كم نقطة لكل 1000 د.ع من قيمة المنتجات (0.5 = نقطة لكل 2000 د.ع)', false],
@@ -5303,6 +5330,14 @@ function versionLess(a, b) {
   return false;
 }
 
+// Each store gets its own update link (Play / App Store / our download link).
+function updateUrlFor(req) {
+  const store = String(req?.headers?.['x-app-store'] || '').toLowerCase();
+  if (store === 'play') return env('APP_UPDATE_URL_PLAY', 'https://play.google.com/store/apps/details?id=com.fayez.mobile');
+  if (store === 'ios') return env('APP_UPDATE_URL_IOS', '') || CFG.app.updateUrl;
+  return CFG.app.updateUrl;
+}
+
 function appStatus(req) {
   const v = String(req.headers['x-app-version'] || '');
   const min = appMinVersion();
@@ -5311,7 +5346,7 @@ function appStatus(req) {
     version: v || null,
     minVersion: min || null,
     latestVersion: latest || null,
-    updateUrl: CFG.app.updateUrl,
+    updateUrl: updateUrlFor(req),
     message: CFG.app.updateMessage,
     forceUpdate: Boolean(min) && (!v || versionLess(v, min)),
     updateAvailable: Boolean(latest) && Boolean(v) && versionLess(v, latest),
@@ -5322,7 +5357,7 @@ function appStatus(req) {
 function checkAppVersion(req) {
   if (!appMinVersion()) return;
   if (appStatus(req).forceUpdate) {
-    throw new AppError(426, `${CFG.app.updateMessage}\n${CFG.app.updateUrl}`);
+    throw new AppError(426, `${CFG.app.updateMessage}\n${updateUrlFor(req)}`);
   }
 }
 
@@ -5342,7 +5377,7 @@ function updateNoticeTime() {
 
 function withUpdatePromo(req, kind, data) {
   if (!appMinVersion() || !appStatus(req).forceUpdate) return data;
-  const link = { type: 'url', url: CFG.app.updateUrl };
+  const link = { type: 'url', url: updateUrlFor(req) };
   if (kind === 'banners') {
     const banner = {
       id: 'app-update-' + appMinVersion(),
@@ -5399,6 +5434,11 @@ async function handleRequest(req, res) {
     if (req.method === 'GET' && p === '/update-banner.jpg') {
       res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=86400' });
       return res.end(UPDATE_BANNER_JPG);
+    }
+
+    if (req.method === 'GET' && (p === '/.well-known/apple-app-site-association' || p === '/apple-app-site-association')) {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' });
+      return res.end(JSON.stringify(appleAppSiteAssociation()));
     }
 
     if (req.method === 'GET' && p === '/.well-known/assetlinks.json') {
@@ -5812,4 +5852,4 @@ if (require.main === module) {
 }
 
 module.exports = {
-  appFlags, dailySummary, waseetInfo, orderStep, orderStage, waseetTimeline, noteWaseet, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
+  appFlags, dailySummary, waseetInfo, orderStep, orderStage, updateUrlFor, waseetTimeline, noteWaseet, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
