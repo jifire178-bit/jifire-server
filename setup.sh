@@ -104,6 +104,12 @@ done
 mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
 $SITES {
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options nosniff
+    Referrer-Policy strict-origin-when-cross-origin
+    -Server
+  }
   reverse_proxy 127.0.0.1:8080
 }
 EOF

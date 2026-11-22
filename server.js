@@ -5805,7 +5805,8 @@ if (require.main === module) {
   if (!CFG.publicUrl) missing.push('PUBLIC_URL');
   if (missing.length) console.warn('⚠️  Missing settings:', missing.join(', '));
   if (!CFG.appKey) console.warn('⚠️  APP_KEY is empty: anyone can call /api/orders');
-  server.listen(CFG.port, () => {
+  // Only Caddy (on this machine) talks to Node; never reachable from outside.
+  server.listen(CFG.port, env('HOST', '127.0.0.1'), () => {
     log(`Ji Fire order server on :${CFG.port} | card payments: ${hyperpayEnabled() ? 'on' : 'off'} | OTP login: ${otpEnabled() ? 'on' : 'off'}`);
   });
 }
