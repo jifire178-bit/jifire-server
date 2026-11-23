@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.17';
+const APP_RELEASE = '3.9.18';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -285,6 +285,11 @@ function pruneState() {
   if (state.abandonOffers) olderThan(state.abandonOffers, Math.max(60, CFG.abandon.everyDays * 2) * 86400e3);
   if (state.appCodes) olderThan(state.appCodes, 7 * 86400e3, (v) => v.exp);
   if (state.crashes) state.crashes = state.crashes.slice(0, 100);
+  try {
+    pruneAqsatiDocs();
+  } catch (e) {
+    log('docs prune', e.message);
+  }
 }
 
 function saveState() {
@@ -2877,7 +2882,8 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       { key: 'عدد الأشهر', value: String(aqsati.plan.months) },
       { key: 'المبلغ بعد الفائدة', value: String(aqsati.plan.finalAmount) },
       { key: 'القسط الشهري', value: String(aqsati.plan.perMonth) },
-      { key: 'رقم حساب أقساطي', value: String(aqsati.identity) }
+      { key: 'رقم حساب أقساطي', value: String(aqsati.identity) },
+      ...(aqsati.docId ? [{ key: 'مستمسكات أقساطي', value: `${CFG.publicUrl}/admin/docs/${aqsati.docId}` }] : [])
     );
     if (aqsatiDemo()) tags.push('تجربة أقساطي – ليس حقيقياً');
     else tags.push('osp: تم الدفع عن طريق اقساطي بنجاح');
@@ -3587,13 +3593,103 @@ async function aqsatiIdentity(body, sessionPhone) {
     repaymentLimit: info.repaymentLimit,
   });
   saveState();
-  return { plans, repaymentLimit: info.repaymentLimit ?? null };
+  return {
+    plans,
+    repaymentLimit: info.repaymentLimit ?? null,
+    docs: docsRequired() ? Object.entries(DOC_KINDS).map(([kind, label]) => ({ kind, label, done: Boolean(p.docs?.[kind]) })) : [],
+  };
+}
+
+// ------------------------------------------------------ aqsati documents ---
+// Before the Aqsati code, the customer photographs the national ID card and
+// the residence card (front + back). Photos are encrypted (AES-256-GCM) on the
+// server disk, never on Shopify, and open only inside the admin panel.
+const DOC_KINDS = {
+  id_front: 'البطاقة الوطنية - الوجه',
+  id_back: 'البطاقة الوطنية - الظهر',
+  res_front: 'بطاقة السكن - الوجه',
+  res_back: 'بطاقة السكن - الظهر',
+};
+const docsRequired = () => bool('AQSATI_DOCS_REQUIRED', true);
+const docsDir = (id) => path.join(CFG.dataDir, 'aqsati-docs', id || '');
+let docsKeyCache = null;
+function docsKey() {
+  if (docsKeyCache) return docsKeyCache;
+  const f = path.join(CFG.dataDir, 'aqsati-docs.key');
+  try {
+    const k = Buffer.from(fs.readFileSync(f, 'utf8').trim(), 'hex');
+    if (k.length === 32) return (docsKeyCache = k);
+  } catch {}
+  const k = crypto.randomBytes(32);
+  fs.mkdirSync(CFG.dataDir, { recursive: true });
+  fs.writeFileSync(f, k.toString('hex'), { mode: 0o600 });
+  return (docsKeyCache = k);
+}
+function sealDoc(buf) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', docsKey(), iv);
+  const enc = Buffer.concat([c.update(buf), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), enc]);
+}
+function openDoc(buf) {
+  const d = crypto.createDecipheriv('aes-256-gcm', docsKey(), buf.subarray(0, 12));
+  d.setAuthTag(buf.subarray(12, 28));
+  return Buffer.concat([d.update(buf.subarray(28)), d.final()]);
+}
+const missingDocs = (p) => Object.keys(DOC_KINDS).filter((k) => !p.docs?.[k]);
+
+/** Step 2b: one photo (JPEG, base64) of the ID / residence card. */
+async function aqsatiDoc(body, sessionPhone) {
+  const p = aqsatiPending(String(body?.ref || ''), sessionPhone);
+  if (!p.sessionId) throw new AppError(400, 'أدخل رقم الحساب أولاً');
+  const kind = String(body?.kind || '');
+  if (!DOC_KINDS[kind]) throw new AppError(400, 'نوع الصورة غير معروف');
+  rateLimit(p.order.customer.phone, 'aqsati-doc', 30, 30 * 60e3);
+  const img = Buffer.from(String(body?.image || ''), 'base64');
+  const jpeg = img[0] === 0xff && img[1] === 0xd8;
+  const png = img.subarray(0, 4).toString('hex') === '89504e47';
+  if (!(jpeg || png) || img.length < 5000) throw new AppError(400, 'الصورة غير واضحة، صوّرها مرة ثانية');
+  if (img.length > 4 * 1024 * 1024) throw new AppError(413, 'الصورة كبيرة جداً');
+  p.docId = p.docId || crypto.randomBytes(16).toString('hex');
+  fs.mkdirSync(docsDir(p.docId), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(docsDir(p.docId), kind + '.bin'), sealDoc(img), { mode: 0o600 });
+  p.docs = { ...(p.docs || {}), [kind]: png ? 'png' : 'jpg' };
+  saveState();
+  return { ok: true, missing: missingDocs(p) };
+}
+
+/** Old uploads: unfinished ones after 2 days, finished ones after AQSATI_DOCS_DAYS (365). */
+function pruneAqsatiDocs() {
+  const root = docsDir();
+  let ids = [];
+  try {
+    ids = fs.readdirSync(root);
+  } catch {
+    return;
+  }
+  const keepDays = Number(env('AQSATI_DOCS_DAYS', '365')) || 365;
+  const live = new Set(Object.values(state.pending || {}).map((p) => p.docId).filter(Boolean));
+  for (const id of ids) {
+    const rec = state.aqsatiDocs?.[id];
+    let age = 0;
+    try {
+      age = Date.now() - fs.statSync(path.join(root, id)).mtimeMs;
+    } catch {}
+    const old = rec ? Date.now() - rec.at > keepDays * 86400e3 : !live.has(id) && age > 2 * 86400e3;
+    if (old) {
+      fs.rmSync(path.join(root, id), { recursive: true, force: true });
+      if (rec) delete state.aqsatiDocs[id];
+    }
+  }
 }
 
 /** Step 3: choose months -> Aqsati sends a code to the customer's device. */
 async function aqsatiPlan(body, sessionPhone) {
   const p = aqsatiPending(String(body?.ref || ''), sessionPhone);
   if (!p.sessionId) throw new AppError(400, 'أدخل رقم الحساب أولاً');
+  if (docsRequired() && missingDocs(p).length) {
+    throw new AppError(400, 'ارفع صور البطاقة الوطنية وبطاقة السكن (الوجه والظهر) أولاً');
+  }
   const months = Number(body?.months);
   const plan = planOptions(p.amount).find((x) => x.months === months);
   if (!plan) throw new AppError(400, 'اختر عدد الأشهر');
@@ -3627,9 +3723,20 @@ async function aqsatiConfirm(body, sessionPhone) {
     const created = await createShopifyOrder(p.order, p.priced, {
       paid: true,
       gatewayRef: String(inst?.installmentId ?? inst?.operationId ?? ''),
-      aqsati: { plan: p.plan, installmentId: inst?.installmentId, identity: p.identity },
+      aqsati: { plan: p.plan, installmentId: inst?.installmentId, identity: p.identity, docId: p.docId },
     });
     Object.assign(p, { stage: 'done', orderName: created.orderName });
+    if (p.docId) {
+      state.aqsatiDocs = state.aqsatiDocs || {};
+      state.aqsatiDocs[p.docId] = {
+        orderName: created.orderName,
+        name: p.order.customer.name,
+        phone: p.order.customer.phone,
+        identity: p.identity,
+        kinds: p.docs,
+        at: Date.now(),
+      };
+    }
     state.idempotency[p.order.idempotencyKey] = {
       at: Date.now(),
       result: { status: 'created', orderName: created.orderName, total: created.total, currency: created.currency },
@@ -4111,6 +4218,8 @@ const EDITABLE = [
   ['AQSATI_API_BASE_URL', 'رابط API أقساطي (أو demo للتجربة بدون مفاتيح)', false],
   ['AQSATI_MERCHANT_KEY', 'مفتاح التاجر لأقساطي', true],
   ['AQSATI_PLANS', 'خطط التقسيط أشهر:نسبة (10:25,18:40)', false],
+  ['AQSATI_DOCS_REQUIRED', 'طلب صور البطاقة الوطنية وبطاقة السكن قبل رمز أقساطي', false],
+  ['AQSATI_DOCS_DAYS', 'مدة الاحتفاظ بصور المستمسكات (أيام، الافتراضي 365)', false],
 ];
 
 function adminPassOk(given) {
@@ -4557,7 +4666,8 @@ const ADMIN_GROUPS = [
   { id: 'otp', title: 'رمز الدخول (MSG91)', icon: '🔐', test: (k) => /^(MSG91_|OTP_)/.test(k),
     note: 'إرسال رمز التحقق عبر SMS وواتساب.' },
   { id: 'hyperpay', title: 'الدفع بالبطاقة (HyperPay)', icon: '💳', test: (k) => k.startsWith('HYPERPAY_') },
-  { id: 'aqsati', title: 'التقسيط (أقساطي)', icon: '🏦', test: (k) => k.startsWith('AQSATI_') },
+  { id: 'aqsati', title: 'التقسيط (أقساطي)', icon: '🏦', test: (k) => k.startsWith('AQSATI_'),
+    note: 'صور مستمسكات الزبائن: افتح الرابط /admin/docs (أو الرابط المكتوب على الطلب بشوبيفاي).' },
   { id: 'ai', title: 'المساعد الذكي (AI)', icon: '🧠', test: (k) => k.startsWith('AI_') },
   { id: 'firebase', title: 'إشعارات Firebase', icon: '🔥', test: (k) => k.startsWith('FIREBASE_'),
     note: 'مفتاح الخدمة لإرسال إشعارات حالة الطلب.' },
@@ -5132,6 +5242,54 @@ async function adminSendPush(body) {
   return { ok: true, sent, failed };
 }
 
+// Aqsati ID photos: list, one customer, one photo. Admin login only.
+function adminDocs(req, res, p, url) {
+  const secure = { 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Robots-Tag': 'noindex' };
+  if (!adminSessionOk(req)) {
+    res.writeHead(302, { Location: '/admin', ...secure });
+    return res.end();
+  }
+  const esc = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  const m = /^\/admin\/docs(?:\/([a-f0-9]{32}))?(?:\/([a-z_]+))?$/.exec(p);
+  if (!m) throw new AppError(404, 'غير موجود');
+  const [, id, kind] = m;
+  if (id && kind) {
+    const rec = state.aqsatiDocs?.[id];
+    const pend = Object.values(state.pending || {}).find((x) => x.docId === id);
+    const type = (rec?.kinds || pend?.docs || {})[kind];
+    if (!DOC_KINDS[kind] || !type) throw new AppError(404, 'غير موجود');
+    const img = openDoc(fs.readFileSync(path.join(docsDir(id), kind + '.bin')));
+    log('admin: docs view', id.slice(0, 6), kind);
+    res.writeHead(200, { 'Content-Type': type === 'png' ? 'image/png' : 'image/jpeg', ...secure });
+    return res.end(img);
+  }
+  const page = (title, body) =>
+    `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${esc(title)}</title><style>body{margin:0;background:#0A0A0C;color:#F5F5F7;font:15px system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif}.wrap{max-width:900px;margin:auto;padding:16px}h1{font-size:20px;color:#E2B85A}a{color:#E2B85A;text-decoration:none}.row{display:block;background:#141417;border:1px solid #2A2A30;border-radius:16px;padding:14px;margin:10px 0;color:inherit}.mu{color:#8E8E96;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.grid figure{margin:0;background:#141417;border:1px solid #2A2A30;border-radius:16px;padding:10px}.grid img{width:100%;border-radius:10px;display:block}figcaption{margin-top:8px;font-weight:700}.back{display:inline-block;margin-bottom:8px}</style></head><body><div class="wrap">${body}</div></body></html>`;
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...secure });
+  if (id) {
+    const rec = state.aqsatiDocs?.[id];
+    const pend = Object.values(state.pending || {}).find((x) => x.docId === id);
+    const kinds = rec?.kinds || pend?.docs;
+    if (!kinds) return res.end(page('غير موجود', '<a class="back" href="/admin/docs">‹ كل المستمسكات</a><p>لا توجد صور (ربما انتهت مدة الاحتفاظ).</p>'));
+    const head = rec
+      ? `<h1>طلب ${esc(rec.orderName)} — ${esc(rec.name)}</h1><div class="mu">${esc(String(rec.phone).replace('+964', '0'))} · حساب أقساطي ${esc(rec.identity)} · ${new Date(rec.at).toLocaleString('ar-IQ', { timeZone: 'Asia/Baghdad' })}</div>`
+      : `<h1>${esc(pend.order.customer.name)} (لم يكتمل الطلب)</h1>`;
+    const figs = Object.keys(DOC_KINDS)
+      .filter((k) => kinds[k])
+      .map((k) => `<figure><a href="/admin/docs/${id}/${k}" target="_blank"><img loading="lazy" src="/admin/docs/${id}/${k}" alt=""></a><figcaption>${esc(DOC_KINDS[k])}</figcaption></figure>`)
+      .join('');
+    return res.end(page('مستمسكات', `<a class="back" href="/admin/docs">‹ كل المستمسكات</a>${head}<div class="grid" style="margin-top:14px">${figs}</div>`));
+  }
+  const q = String(url.searchParams.get('q') || '').trim();
+  const list = Object.entries(state.aqsatiDocs || {})
+    .filter(([, r]) => !q || [r.orderName, r.name, r.phone, r.identity].some((x) => String(x || '').includes(q.replace(/^0/, ''))))
+    .sort((a, b) => b[1].at - a[1].at)
+    .slice(0, 200)
+    .map(([k, r]) => `<a class="row" href="/admin/docs/${k}"><b>${esc(r.orderName)}</b> — ${esc(r.name)}<div class="mu">${esc(String(r.phone).replace('+964', '0'))} · ${new Date(r.at).toLocaleDateString('ar-IQ', { timeZone: 'Asia/Baghdad' })}</div></a>`)
+    .join('');
+  return res.end(page('مستمسكات أقساطي', `<a class="back" href="/admin">‹ لوحة الإدارة</a><h1>مستمسكات أقساطي</h1><form><input name="q" value="${esc(q)}" placeholder="بحث برقم الطلب أو الاسم أو الهاتف" style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid #3A3A42;background:#1C1C21;color:#fff;font-size:15px"></form>${list || '<p class="mu">لا توجد مستمسكات بعد.</p>'}`));
+}
+
 async function handleAdmin(req, res, p, url) {
   if (p === '/admin/logo.png') {
     res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
@@ -5141,6 +5299,7 @@ async function handleAdmin(req, res, p, url) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
     return res.end(ADMIN_HTML);
   }
+  if (p === '/admin/docs' || p.startsWith('/admin/docs/')) return adminDocs(req, res, p, url);
   if (p === '/admin/login' && req.method === 'POST') {
     rateLimit(clientIp(req), 'admin', 8, 10 * 60e3);
     let body;
@@ -5560,8 +5719,9 @@ async function handleRequest(req, res) {
       checkAppKey(req);
       let body;
       try {
-        body = JSON.parse(await readBody(req));
-      } catch {
+        body = JSON.parse(await readBody(req, p === '/api/aqsati/doc' ? 6 * 1024 * 1024 : undefined));
+      } catch (e) {
+        if (e instanceof AppError) throw e;
         throw new AppError(400, 'طلب غير صالح');
       }
       const phone = readSession(req);
@@ -5569,6 +5729,7 @@ async function handleRequest(req, res) {
       const fn = { start: () => aqsatiStart(body, clientIp(req), phone),
         identity: () => aqsatiIdentity(body, phone),
         plan: () => aqsatiPlan(body, phone),
+        doc: () => aqsatiDoc(body, phone),
         confirm: () => aqsatiConfirm(body, phone) }[step];
       if (!fn) throw new AppError(404, 'غير موجود');
       return send(res, 200, await fn());
