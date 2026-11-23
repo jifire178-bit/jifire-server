@@ -5291,6 +5291,19 @@ function adminDocs(req, res, p, url) {
 }
 
 async function handleAdmin(req, res, p, url) {
+  // CSRF: a change to the admin can only come from the admin page itself.
+  // (The cookie is SameSite=Lax as well; this also stops same-site tricks.)
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const origin = String(req.headers.origin || '');
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    if (origin && origin !== 'null') {
+      let ok = false;
+      try {
+        ok = new URL(origin).host === host;
+      } catch {}
+      if (!ok) throw new AppError(403, 'طلب غير مسموح');
+    }
+  }
   if (p === '/admin/logo.png') {
     res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
     return res.end(ADMIN_LOGO);
