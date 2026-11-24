@@ -44,9 +44,24 @@ id caddy >/dev/null 2>&1 || useradd --system --home /var/lib/caddy --create-home
 say "3/6 Downloading the order server"
 id jifire >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin jifire
 mkdir -p "$APP_DIR/data"
-for f in server.js package.json env.example; do
+for f in package.json env.example; do
   curl -fsSL "$REPO_RAW/$f" -o "$APP_DIR/$f"
 done
+# server.js: download beside the running copy, check it, keep the old one.
+# A broken or half-downloaded file never replaces a working server.
+NEW_CODE=0
+if curl -fsSL "$REPO_RAW/server.js" -o "$APP_DIR/server.js.new" && node --check "$APP_DIR/server.js.new" 2>/dev/null; then
+  if [ -f "$APP_DIR/server.js" ] && ! cmp -s "$APP_DIR/server.js" "$APP_DIR/server.js.new"; then
+    cp -p "$APP_DIR/server.js" "$APP_DIR/server.js.prev"
+    NEW_CODE=1
+  fi
+  mv -f "$APP_DIR/server.js.new" "$APP_DIR/server.js"
+  echo "server.js sha256: $(sha256sum "$APP_DIR/server.js" | cut -c1-16)…"
+else
+  rm -f "$APP_DIR/server.js.new"
+  [ -f "$APP_DIR/server.js" ] || { echo "Could not download server.js"; exit 1; }
+  echo "New server.js missing or broken: the current one is kept."
+fi
 
 say "4/6 Settings"
 IP=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
@@ -86,6 +101,7 @@ WorkingDirectory=$APP_DIR
 ExecStart=/usr/local/bin/node $APP_DIR/server.js
 Restart=always
 RestartSec=3
+LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -122,6 +138,7 @@ User=caddy
 ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=65535
 Restart=always
 [Install]
 WantedBy=multi-user.target
@@ -134,9 +151,23 @@ systemctl enable caddy >/dev/null 2>&1
 systemctl restart caddy
 
 say "6/6 Checking"
-sleep 4
-if curl -fsS http://127.0.0.1:8080/health >/dev/null; then echo "Order server: OK"; else
-  echo "Order server failed:"; journalctl -u jifire-orders -n 20 --no-pager; fi
+UP=0
+for i in $(seq 1 10); do
+  sleep 3
+  if curl -fsS http://127.0.0.1:8080/health >/dev/null; then UP=1; break; fi
+done
+if [ "$UP" = 1 ]; then echo "Order server: OK"; else
+  echo "Order server failed:"; journalctl -u jifire-orders -n 20 --no-pager
+  # Automatic rollback: the new code does not start, go back to the last one.
+  if [ "$NEW_CODE" = 1 ] && [ -f "$APP_DIR/server.js.prev" ]; then
+    echo "Rolling back to the previous server.js"
+    cp -p "$APP_DIR/server.js" "$APP_DIR/server.js.bad"
+    cp -p "$APP_DIR/server.js.prev" "$APP_DIR/server.js"
+    systemctl restart jifire-orders
+    sleep 5
+    curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "Previous version is running."
+  fi
+fi
 for i in $(seq 1 20); do
   if curl -fsS "https://$DOMAIN/health" >/dev/null 2>&1; then OK=1; break; fi
   sleep 3

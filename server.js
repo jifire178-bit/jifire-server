@@ -48,7 +48,7 @@ const num = (k, d) => {
 
 // Latest app release. Bumped with every new APK: with APP_FORCE_LATEST on,
 // only this version (or newer) can order/log in; older ones see "update".
-const APP_RELEASE = '3.9.18';
+const APP_RELEASE = '3.9.19';
 
 const CFG = {
   // Forced update: app versions below APP_MIN_VERSION are blocked with a link.
@@ -292,8 +292,12 @@ function pruneState() {
   }
 }
 
+// Written at most every STATE_SAVE_MS. The timer is not pushed back by new
+// changes: under a steady stream of requests a sliding timer would never fire
+// and nothing would reach the disk until things calm down.
+const STATE_SAVE_MS = Number(env('STATE_SAVE_MS', '500'));
 function saveState() {
-  clearTimeout(saveTimer);
+  if (saveTimer) return;
   saveTimer = setTimeout(() => {
     const now = Date.now();
     for (const [k, v] of Object.entries(state.idempotency)) {
@@ -303,7 +307,7 @@ function saveState() {
       if (now - v.at > 3 * 24 * 3600e3) delete state.pending[k];
     }
     writeStateNow();
-  }, 200);
+  }, STATE_SAVE_MS);
 }
 
 // --------------------------------------------------------- shopify admin ---
@@ -342,10 +346,175 @@ async function fetchAdminToken() {
   return tokenCache.token;
 }
 
-async function admin(query, variables = {}) {
+// ---- Shopify Admin gateway --------------------------------------------
+// One door to the Admin API for everything the server does. It:
+//  * spends Shopify's points budget (Grow plan: 100 points/s per app) with a
+//    priority: orders > customer screens > background jobs. Background jobs
+//    only run while plenty is left, so a rush of customers never waits behind
+//    a poller;
+//  * caps the total wait of a customer request (20 s) instead of 4 x 25 s;
+//  * never blindly repeats a write: if a mutation's answer is lost the caller
+//    is told (err.uncertain) and checks Shopify before trying again;
+//  * shares identical reads that are in flight and keeps short-lived copies
+//    when the caller asks for it (opts.cache).
+const SHOP_GATE = {
+  max: Number(env('SHOPIFY_BUCKET_MAX', '1000')),     // updated from Shopify's answers
+  restore: Number(env('SHOPIFY_RESTORE_RATE', '100')), // points per second (Grow = 100)
+  avail: null, at: 0, // last known
+  inFlight: 0, maxInFlight: Number(env('SHOPIFY_MAX_INFLIGHT', '32')),
+  queue: [], // waiting {prio, cost, resolve, deadline}
+  est: new Map(), // operation -> last requested cost
+  stats: { calls: 0, throttled: 0, waitedMs: 0, cacheHits: 0, coalesced: 0, uncertain: 0 },
+};
+const PRIO = { order: 0, ui: 1, low: 2, bg: 3 };
+// Keep this share of the bucket free for higher priorities.
+const RESERVE = { order: 0, ui: 0.1, low: 0.3, bg: 0.5 };
+function gatePoints(now = Date.now()) {
+  const g = SHOP_GATE;
+  if (g.avail == null) return g.max;
+  return Math.min(g.max, g.avail + ((now - g.at) / 1000) * g.restore);
+}
+function gateFits(prio, cost) {
+  const g = SHOP_GATE;
+  if (g.inFlight >= g.maxInFlight) return false;
+  return gatePoints() - cost >= g.max * RESERVE[prio];
+}
+function gatePump() {
+  const g = SHOP_GATE;
+  g.queue.sort((a, b) => PRIO[a.prio] - PRIO[b.prio] || a.t - b.t);
+  const now = Date.now();
+  // Give up on every waiter past its deadline first (also the ones behind a
+  // blocked higher-priority call), so nobody hangs past their budget.
+  for (let i = 0; i < g.queue.length; i++) {
+    const w = g.queue[i];
+    if (now > w.deadline) { g.queue.splice(i--, 1); w.resolve(false); }
+  }
+  for (let i = 0; i < g.queue.length; i++) {
+    const w = g.queue[i];
+    if (!gateFits(w.prio, w.cost)) {
+      // A higher-priority waiter that doesn't fit blocks the ones behind it,
+      // otherwise cheap background calls would starve an order.
+      if (w.prio === 'order' || w.prio === 'ui') break;
+      continue;
+    }
+    g.queue.splice(i--, 1);
+    gateTake(w.cost);
+    w.resolve(true);
+  }
+  if (g.queue.length && !g.timer) {
+    g.timer = setTimeout(() => { g.timer = null; gatePump(); }, 100);
+    g.timer.unref?.();
+  }
+}
+function gateTake(cost) {
+  const g = SHOP_GATE;
+  g.avail = gatePoints() - cost; // optimistic; corrected by Shopify's answer
+  g.at = Date.now();
+  g.inFlight++;
+}
+function gateRelease(throttleStatus, cost = 0) {
+  const g = SHOP_GATE;
+  g.inFlight = Math.max(0, g.inFlight - 1);
+  if (!throttleStatus && cost && g.avail != null) {
+    // No cost report (network error, older proxy): give the guess back.
+    g.avail = Math.min(g.max, gatePoints() + cost);
+    g.at = Date.now();
+  }
+  if (throttleStatus) {
+    g.max = Number(throttleStatus.maximumAvailable) || g.max;
+    g.restore = Number(throttleStatus.restoreRate) || g.restore;
+    g.avail = Number(throttleStatus.currentlyAvailable);
+    g.at = Date.now();
+  }
+  gatePump();
+}
+/** How long a new call of this priority would wait for Shopify points now. */
+function gateWaitMs(prio, cost) {
+  const g = SHOP_GATE;
+  let ahead = cost;
+  for (const w of g.queue) if (PRIO[w.prio] <= PRIO[prio]) ahead += w.cost;
+  const free = gatePoints() - g.max * RESERVE[prio];
+  return (Math.max(0, ahead - free) / g.restore) * 1000;
+}
+async function gateEnter(prio, cost, deadline) {
+  const g = SHOP_GATE;
+  if (!g.queue.length && gateFits(prio, cost)) { gateTake(cost); return true; }
+  // Load shedding: if the points already queued ahead of this call cannot be
+  // restored before its deadline, say "busy" now instead of after a long wait.
+  // Under a rush this keeps the accepted requests fast instead of every
+  // request waiting 20 s and then failing.
+  if (Date.now() + gateWaitMs(prio, cost) > deadline) { g.stats.shed = (g.stats.shed || 0) + 1; return false; }
+  const t = Date.now();
+  const ok = await new Promise((resolve) => {
+    SHOP_GATE.queue.push({ prio, cost, resolve, deadline, t });
+    gatePump();
+  });
+  SHOP_GATE.stats.waitedMs += Date.now() - t;
+  return ok;
+}
+
+// Short copies of read-only screens (prices for the cart badge, add-on quotes).
+const READ_CACHE_MS = Number(env('READ_CACHE_MS', '30000'));
+const adminCache = new Map(); // key -> {at, ttl, value} | {p}
+function adminCachePut(key, v) {
+  adminCache.delete(key);
+  adminCache.set(key, v);
+  if (adminCache.size > Number(env('ADMIN_CACHE_MAX', '20000'))) adminCache.delete(adminCache.keys().next().value);
+}
+function adminCacheDrop(prefix) {
+  for (const k of adminCache.keys()) if (k.startsWith(prefix)) adminCache.delete(k);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of adminCache) if (v.at && now - v.at > Math.max(v.ttl, v.stale || 0)) adminCache.delete(k);
+}, 60e3).unref();
+
+const opName = (q) => (/^\s*(?:query|mutation)\s+(\w+)/.exec(q) || [])[1] || 'anon';
+
+async function admin(query, variables = {}, opts = {}) {
+  const key = opts.cache ? opts.cache.key : null;
+  if (key) {
+    const hit = adminCache.get(key);
+    if (hit?.at && Date.now() - hit.at < hit.ttl) { SHOP_GATE.stats.cacheHits++; return hit.value; }
+    if (hit?.p) { SHOP_GATE.stats.coalesced++; return hit.p; }
+    const stale = hit?.at ? hit : null;
+    const p = adminCall(query, variables, opts);
+    adminCache.set(key, { p, stale });
+    try {
+      const value = await p;
+      adminCachePut(key, { at: Date.now(), ttl: opts.cache.ttl, stale: opts.cache.staleMs || 0, value });
+      return value;
+    } catch (e) {
+      // Shop too busy to answer in time: an earlier copy beats an error screen.
+      if (e.status === 503 && stale && Date.now() - stale.at < (stale.stale || 0)) {
+        adminCache.set(key, stale);
+        SHOP_GATE.stats.servedStale = (SHOP_GATE.stats.servedStale || 0) + 1;
+        return stale.value;
+      }
+      adminCache.delete(key);
+      throw e;
+    }
+  }
+  return adminCall(query, variables, opts);
+}
+
+async function adminCall(query, variables, opts) {
   const base = CFG.adminBase || `https://${CFG.shop}`;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  const mutation = /^\s*mutation\b/.test(query);
+  const ctx = reqContext.getStore();
+  const prio = opts.prio || ctx?.prio || (ctx ? 'ui' : 'bg');
+  const budget = opts.budgetMs || ctx?.budgetMs || (prio === 'bg' ? 120e3 : prio === 'order' ? 25000 : Number(env('SHOPIFY_UI_BUDGET_MS', '15000')));
+  const deadline = Date.now() + budget;
+  const op = opName(query);
+  const busy = () => new AppError(503, 'المتجر مشغول حالياً، حاول بعد لحظات');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const cost = SHOP_GATE.est.get(op) || (mutation ? 10 : 20);
+    if (!(await gateEnter(prio, cost, deadline))) throw busy();
+    const left = deadline - Date.now();
+    if (left < 500) { gateRelease(null, cost); throw busy(); }
+    SHOP_GATE.stats.calls++;
     let res;
+    let json = null;
     try {
       res = await fetch(`${base}/admin/api/${CFG.apiVersion}/graphql.json`, {
         method: 'POST',
@@ -354,27 +523,45 @@ async function admin(query, variables = {}) {
           'X-Shopify-Access-Token': await adminToken(),
         },
         body: JSON.stringify({ query, variables }),
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(Math.min(left, 15000)),
       });
+      if (res.status < 500) json = await res.json().catch(() => ({}));
     } catch (e) {
-      // network hiccup / timeout: wait a little and try again
-      log('admin fetch retry', attempt + 1, String(e.message || e).slice(0, 120));
-      await sleep(600 * (attempt + 1));
+      gateRelease(null, cost);
+      log('admin fetch failed', op, attempt + 1, String(e.message || e).slice(0, 120));
+      if (mutation && !opts.retrySafe) {
+        // The write may or may not have happened. Never repeat it here.
+        SHOP_GATE.stats.uncertain++;
+        const err = busy();
+        err.uncertain = true;
+        throw err;
+      }
+      await sleep(Math.min(600 * (attempt + 1), Math.max(0, deadline - Date.now() - 500)));
       continue;
     }
+    const cost0 = json?.extensions?.cost;
+    if (cost0?.requestedQueryCost) SHOP_GATE.est.set(op, Number(cost0.requestedQueryCost));
+    gateRelease(cost0?.throttleStatus, cost);
     if (res.status >= 500) {
-      await sleep(800 * (attempt + 1));
+      if (mutation && !opts.retrySafe) {
+        SHOP_GATE.stats.uncertain++;
+        const err = busy();
+        err.uncertain = true;
+        throw err;
+      }
+      await sleep(Math.min(800 * (attempt + 1), Math.max(0, deadline - Date.now() - 500)));
       continue;
     }
     if (res.status === 401 && !CFG.staticToken) {
       tokenCache = { token: null, exp: 0 };
       continue;
     }
-    const json = await res.json().catch(() => ({}));
     const throttled = (json.errors || []).some((e) => e?.extensions?.code === 'THROTTLED');
     if (throttled || res.status === 429) {
-      await sleep(1000 * 2 ** attempt); // 1s, 2s, 4s
-      continue;
+      // Shopify did not run the query: safe to retry, mutations included.
+      SHOP_GATE.stats.throttled++;
+      if (!cost0?.throttleStatus) { SHOP_GATE.avail = 0; SHOP_GATE.at = Date.now(); }
+      continue; // the gate waits until enough points are back
     }
     if (!res.ok || json.errors) {
       log('admin error', res.status, JSON.stringify(json.errors || json).slice(0, 800));
@@ -387,9 +574,10 @@ async function admin(query, variables = {}) {
       if (!err.shopify.length) err.shopify = [{ message: `HTTP ${res.status}`, code: '', path: '' }];
       throw err;
     }
+    if (mutation && opts.dropCache) for (const p of [].concat(opts.dropCache)) adminCacheDrop(p);
     return json.data;
   }
-  throw new AppError(503, 'المتجر مشغول حالياً، حاول بعد لحظات');
+  throw busy();
 }
 
 const VARIANTS_QUERY = `
@@ -402,6 +590,30 @@ query Variants($ids: [ID!]!) {
     }
   }
 }`;
+
+const ORDER_BY_SOURCE = `
+query OrderBySource($q: String!) {
+  orders(first: 1, query: $q) {
+    nodes { id name customer { id } totalPriceSet { shopMoney { amount currencyCode } } }
+  }
+}`;
+/** The order made from this checkout (sourceIdentifier = idempotency key), if
+ *  Shopify has it. Search can lag a few seconds, so look three times. */
+const uncertainOrders = new Map(); // idempotency key -> when its answer was lost
+setInterval(() => { for (const [k, t] of uncertainOrders) if (Date.now() - t > 86400e3) uncertainOrders.delete(k); }, 3600e3).unref();
+async function findOrderBySource(key) {
+  for (const wait of [1500, 3000, 4500]) {
+    await sleep(wait);
+    try {
+      const d = await admin(ORDER_BY_SOURCE, { q: `source_identifier:'${key}'` }, { prio: 'order', budgetMs: 15000 });
+      const o = d.orders?.nodes?.[0];
+      if (o) return o;
+    } catch (e) {
+      log('findOrderBySource', String(e.message || e).slice(0, 120));
+    }
+  }
+  return null;
+}
 
 const ORDER_CREATE = `
 mutation OrderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
@@ -476,7 +688,7 @@ async function handleAddonQuote(body) {
     .map((l) => ({ variantId: l.variantId, quantity: 1 }));
   if (!lines.length) return { lines: [] };
   const ids = [...new Set(lines.map((l) => l.variantId))];
-  const data = await admin(VARIANTS_QUERY, { ids });
+  const data = await admin(VARIANTS_QUERY, { ids }, { cache: { key: 'var:' + [...ids].sort().join(','), ttl: READ_CACHE_MS, staleMs: 10 * 60e3 } });
   return {
     lines: (data.nodes || []).filter(Boolean).map((v) => {
       const prices = addonPrices({ title: v.product?.title || '', price: Number(v.price), productType: v.product?.productType });
@@ -765,7 +977,7 @@ async function handleCartRules(body) {
   const lines = Array.isArray(body?.lines) ? body.lines.slice(0, 50) : [];
   const ids = [...new Set(lines.map((l) => String(l?.variantId || '')).filter((x) => /^gid:\/\/shopify\/ProductVariant\/\d+$/.test(x)))];
   if (!ids.length) return { cardOnly: false, codOnly: false, products: [], codProducts: [] };
-  const data = await admin(VARIANTS_QUERY, { ids });
+  const data = await admin(VARIANTS_QUERY, { ids }, { cache: { key: 'var:' + [...ids].sort().join(','), ttl: READ_CACHE_MS, staleMs: 10 * 60e3 } });
   const only = (data.nodes || []).filter((v) => v && isCardOnly(v.product?.tags));
   const cod = (data.nodes || []).filter((v) => v && isCodOnly(v.product?.tags));
   return {
@@ -827,7 +1039,18 @@ query Banners {
 }`;
 let bannersCache = { at: 0, data: null };
 
-async function handleBanners() {
+// One Shopify call at a time for shared screens: when the copy expires during
+// a rush, the first request fetches and the others wait for that answer.
+const flights = new Map();
+function singleFlight(key, fn) {
+  if (!flights.has(key)) flights.set(key, Promise.resolve().then(fn).finally(() => flights.delete(key)));
+  return flights.get(key);
+}
+function handleBanners() {
+  if (bannersCache.data && Date.now() - bannersCache.at < 60e3) return Promise.resolve(bannersCache.data);
+  return singleFlight('banners', loadBanners);
+}
+async function loadBanners() {
   if (bannersCache.data && Date.now() - bannersCache.at < 60e3) return bannersCache.data;
   let nodes = [];
   try {
@@ -1250,7 +1473,11 @@ query Notices {
 }`;
 let noticesCache = { at: 0, data: null };
 
-async function handleNotices() {
+function handleNotices() {
+  if (noticesCache.data && Date.now() - noticesCache.at < 60e3) return Promise.resolve(noticesCache.data);
+  return singleFlight('notices', loadNotices);
+}
+async function loadNotices() {
   if (noticesCache.data && Date.now() - noticesCache.at < 60e3) return noticesCache.data;
   let nodes;
   try {
@@ -1441,7 +1668,7 @@ query Fulfilled($q: String!) {
     nodes {
       id name updatedAt displayFulfillmentStatus phone cancelledAt tags
       customAttributes { key value }
-      customer { defaultPhoneNumber { phoneNumber } }
+      customer { id defaultPhoneNumber { phoneNumber } }
       shippingAddress { phone }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
       lineItems(first: 5) { nodes { product { handle title } } }
@@ -1467,6 +1694,7 @@ async function checkFulfilledOrders() {
     const data = await admin(FULFILLED_QUERY, { q: `updated_at:>'${since}'` });
     let newest = op.since;
     for (const o of data.orders?.nodes || []) {
+      dropMyOrders(o.customer?.id); // its "طلباتي" copy is out of date now
       if (o.updatedAt > newest) newest = o.updatedAt;
       const st = orderStep(o);
       if (st.waseet?.text) noteWaseet(o.id, st.waseet, o.updatedAt);
@@ -1597,8 +1825,21 @@ function loyaltyStart() {
   return state.loyalty.startAt;
 }
 
+// Only this server writes the points ledger, so the last copy it read or
+// wrote is kept a few minutes (writes happen under the customer's lock).
+const ledgerCache = new Map(); // customerId -> {at, d}
+const LEDGER_TTL = Number(env('LEDGER_CACHE_MS', String(6 * 3600e3)));
+setInterval(() => { for (const [k, v] of ledgerCache) if (Date.now() - v.at > LEDGER_TTL) ledgerCache.delete(k); }, 60e3).unref();
 async function loadLedger(customerId) {
-  const d = await admin(LEDGER_GET, { id: customerId });
+  const hit = ledgerCache.get(customerId);
+  let d;
+  if (hit && Date.now() - hit.at < LEDGER_TTL) {
+    d = JSON.parse(hit.d);
+    SHOP_GATE.stats.cacheHits++;
+  } else {
+    d = await admin(LEDGER_GET, { id: customerId });
+    if (d.customer && LEDGER_TTL > 0) ledgerCache.set(customerId, { at: Date.now(), d: JSON.stringify(d) });
+  }
   if (!d.customer) throw new AppError(404, 'الحساب غير موجود');
   let ledger;
   try {
@@ -1625,7 +1866,15 @@ async function saveLedger(customerId, ledger) {
     ],
   });
   const errs = r.metafieldsSet?.userErrors || [];
-  if (errs.length) throw new Error('ledger save: ' + JSON.stringify(errs).slice(0, 200));
+  if (errs.length) { ledgerCache.delete(customerId); throw new Error('ledger save: ' + JSON.stringify(errs).slice(0, 200)); }
+  const hit = ledgerCache.get(customerId);
+  if (hit) {
+    const d = JSON.parse(hit.d);
+    if (d.customer) {
+      d.customer.metafield = { value: JSON.stringify(ledger) };
+      ledgerCache.set(customerId, { at: Date.now(), d: JSON.stringify(d) });
+    }
+  }
 }
 
 const ledgerBalance = (l) => l.entries.reduce((a, e) => a + (Number(e.p) || 0), 0);
@@ -1759,25 +2008,62 @@ query TierOrders($q: String!, $after: String) {
   }
 }`;
 
-/** Lifetime spending that counts: delivered (or shipped 10+ days ago), not cancelled/refunded. */
+/** A customer's orders for the app screens. Kept 15 s (shared by "طلباتي",
+ *  points and reviews); dropped as soon as the customer orders or cancels. */
+// The orders poller (every 2 min) drops a customer's copy as soon as one of
+// their orders changes, so the copy can live a few minutes.
+const myOrdersTtl = () => Number(env('MY_ORDERS_CACHE_MS', String(LOY.enabled ? 6 * 3600e3 : 3 * 60e3)));
+function myOrders(numericId) {
+  return admin(MY_ORDERS_QUERY, { q: `customer_id:${numericId}` }, { cache: { key: 'my:' + numericId, ttl: myOrdersTtl(), staleMs: 24 * 3600e3 } });
+}
+/** Out of date: the next look asks Shopify, but if Shopify is too busy to
+ *  answer the old copy is still shown (better than an error screen). */
+function dropMyOrders(customerId) {
+  if (!customerId) return;
+  const k = 'my:' + String(customerId).split('/').pop();
+  const hit = adminCache.get(k);
+  if (hit?.at) hit.at = Date.now() - hit.ttl - 1;
+}
+
+/** Spending changes only when an order is delivered: computed at most every 10 min. */
+const spendCache = new Map();
+const SPEND_TTL = Number(env('SPEND_CACHE_MS', String(6 * 3600e3))); // dropped by the poller when orders change
 async function customerSpend(customerId) {
+  const hit = spendCache.get(customerId);
+  if (hit && Date.now() - hit.at < SPEND_TTL) return hit.v;
+  const v = await customerSpendLive(customerId);
+  spendCache.set(customerId, { at: Date.now(), v });
+  if (spendCache.size > 20000) spendCache.delete(spendCache.keys().next().value);
+  return v;
+}
+
+/** Lifetime spending that counts: delivered (or shipped 10+ days ago), not cancelled/refunded. */
+async function customerSpendLive(customerId) {
   const q = `customer_id:${String(customerId).split('/').pop()}`;
   let spent = 0;
   let orders = 0;
   let after = null;
   for (let page = 0; page < 10; page++) {
     const d = await admin(TIER_ORDERS_QUERY, { q, after });
-    for (const o of d.orders?.nodes || []) {
-      if (['REFUNDED', 'VOIDED'].includes(o.displayFinancialStatus)) continue;
-      const st = orderStep(o);
-      const old = Date.now() - Date.parse(o.createdAt) > 10 * 86400e3;
-      if (st.step === 4 || (st.step === 3 && old)) {
-        spent += Number(o.currentSubtotalPriceSet?.shopMoney?.amount || 0);
-        orders += 1;
-      }
-    }
+    const s1 = spendOf(d.orders?.nodes || []);
+    spent += s1.spent;
+    orders += s1.orders;
     if (!d.orders?.pageInfo?.hasNextPage) break;
     after = d.orders.pageInfo.endCursor;
+  }
+  return { spent: Math.round(spent), orders };
+}
+function spendOf(nodes) {
+  let spent = 0;
+  let orders = 0;
+  for (const o of nodes) {
+    if (['REFUNDED', 'VOIDED'].includes(o.displayFinancialStatus)) continue;
+    const st = orderStep(o);
+    const old = Date.now() - Date.parse(o.createdAt) > 10 * 86400e3;
+    if (st.step === 4 || (st.step === 3 && old)) {
+      spent += Number(o.currentSubtotalPriceSet?.shopMoney?.amount || 0);
+      orders += 1;
+    }
   }
   return { spent: Math.round(spent), orders };
 }
@@ -1833,12 +2119,17 @@ async function reconcileCustomer(customerId, orders, opts = {}) {
   if (!LOY.enabled || !customerId) return null;
   let grantReferrer = null;
   let tierUp = null;
-  const spend = TIERS.enabled ? await customerSpend(customerId).catch((e) => {
+  // Fewer than 20 orders: "طلباتي" already holds all of them, no second query.
+  const spend = TIERS.enabled && opts.allOrders && orders.length < 20
+    ? spendOf(orders)
+    : TIERS.enabled ? await customerSpend(customerId).catch((e) => {
     log('tier spend', String(e.message || e).slice(0, 200));
     return null;
   }) : null;
   const out = await withLoyaltyLock(customerId, async () => {
-    const { ledger, phone } = await loadLedger(customerId);
+    const { ledger, phone, orders: nOrders, createdAt } = await loadLedger(customerId);
+    // Account facts for the points screen, so it doesn't ask Shopify again.
+    Object.defineProperty(ledger, '_acct', { value: { numberOfOrders: nOrders, createdAt }, enumerable: false });
     let changed = false;
     if (spend) {
       const rank = tierFromSpend(spend.spent);
@@ -1929,6 +2220,9 @@ async function checkLoyalty() {
       after = d.orders.pageInfo.endCursor;
     }
     for (const [cid, orders] of byCustomer) {
+      // Something changed on this customer's orders: forget the screens' copies.
+      dropMyOrders(cid);
+      spendCache.delete(cid);
       try {
         await reconcileCustomer(cid, orders, { notify: true });
       } catch (e) {
@@ -1971,13 +2265,29 @@ async function handleLoyaltyMe(phone) {
     c = { id, numberOfOrders: 0 };
   }
   const id = c.id.split('/').pop();
-  const recent = await admin(MY_ORDERS_QUERY, { q: `customer_id:${id}` });
-  const orders = recent.orders?.nodes || [];
-  const ledger = (await reconcileCustomer(c.id, orders)) || { entries: [] };
-  const acct = await admin(LEDGER_GET, { id: c.id }).catch(() => null);
+  // Rush hour (Shopify's points queue is long) and no copy of this customer's
+  // orders: show the points from the ledger alone (cheap) and skip the
+  // "pending" figure. The orders poller keeps the ledger right meanwhile.
+  const copy = adminCache.get('my:' + id);
+  const busy = !copy?.at && gateWaitMs('ui', SHOP_GATE.est.get('MyOrders') || 40) > Number(env('LOYALTY_LITE_WAIT_MS', '3000'));
+  let orders = [];
+  let ledger;
+  if (busy) {
+    SHOP_GATE.stats.loyaltyLite = (SHOP_GATE.stats.loyaltyLite || 0) + 1;
+    const L = await loadLedger(c.id);
+    ledger = L.ledger;
+    Object.defineProperty(ledger, '_acct', { value: { numberOfOrders: L.orders, createdAt: L.createdAt }, enumerable: false });
+  } else {
+    const recent = await myOrders(id);
+    orders = recent.orders?.nodes || [];
+    // Every order is in hand when Shopify's own count says so (and the page isn't full).
+    const allOrders = orders.length < 20 && c.numberOfOrders != null && Number(c.numberOfOrders) <= orders.length;
+    ledger = (await reconcileCustomer(c.id, orders, { allOrders })) || { entries: [] };
+  }
+  const acct = ledger._acct ? { customer: ledger._acct } : await admin(LEDGER_GET, { id: c.id }).catch(() => null);
   const fresh = isNewAccount(acct?.customer?.numberOfOrders ?? c.numberOfOrders, acct?.customer?.createdAt);
   const mult = tierMult(tierRank(ledger.tier?.id));
-  const pending = orders.reduce((a, o) => a + orderPointsTarget(o, mult).pending, 0);
+  const pending = busy ? 0 : orders.reduce((a, o) => a + orderPointsTarget(o, mult).pending, 0);
   const balance = ledgerBalance(ledger);
   const label = { earn: 'طلب مكتمل', redeem: 'استبدال نقاط', welcome: 'هدية الانضمام بدعوة', referral: 'دعوة صديق', tier: 'هدية مستوى VIP', wheel: 'عجلة الحظ' };
   return {
@@ -1989,6 +2299,7 @@ async function handleLoyaltyMe(phone) {
     redeemable: redeemableBalance(ledger),
     locked: lockedWheelPoints(ledger),
     pending,
+    ...(busy ? { lite: true } : {}),
     code: referralCode(c.id),
     referral: {
       applied: Boolean(ledger.ref?.by),
@@ -2705,7 +3016,7 @@ async function handleMyOrders(phone) {
   const c = await customerByPhone(phone);
   if (!c) return { orders: [] };
   const id = c.id.split('/').pop();
-  const data = await admin(MY_ORDERS_QUERY, { q: `customer_id:${id}` });
+  const data = await myOrders(id);
   return {
     orders: (data.orders?.nodes || []).map((o) => {
       const st = orderStep(o);
@@ -2779,6 +3090,7 @@ async function customerCancelOrder(phone, body) {
     }`,
     { id, note: 'ألغاه الزبون من التطبيق' }
   );
+  dropMyOrders(c.id);
   const errs = r.orderCancel?.orderCancelUserErrors || [];
   if (errs.length) {
     log('customer cancel failed', o.name, JSON.stringify(errs).slice(0, 300));
@@ -3015,15 +3327,34 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
 
   let data = null;
   let lastErr = null;
-  for (const attempt of attempts) {
+  // An earlier try of this checkout lost its answer: it may already exist.
+  if (uncertainOrders.has(order.idempotencyKey)) {
+    const found = await findOrderBySource(order.idempotencyKey);
+    if (found) data = { orderCreate: { order: found, userErrors: [] } };
+  }
+  for (const attempt of data ? [] : attempts) {
     try {
-      data = await admin(ORDER_CREATE, { order: attempt, options });
+      data = await admin(ORDER_CREATE, { order: attempt, options }, { prio: 'order', budgetMs: 25000 });
     } catch (e) {
-      if (!e.shopify) throw e; // network/throttle: no point retrying here
-      lastErr = e;
-      log('orderCreate attempt failed', JSON.stringify(e.shopify).slice(0, 600));
-      data = null;
-      continue;
+      if (e.uncertain) {
+        // The answer was lost: the order may exist. Look before writing again.
+        const found = await findOrderBySource(order.idempotencyKey);
+        if (found) { data = { orderCreate: { order: found, userErrors: [] } }; break; }
+        log('orderCreate uncertain, not found; trying once more', order.idempotencyKey);
+        try {
+          data = await admin(ORDER_CREATE, { order: attempt, options }, { prio: 'order', budgetMs: 20000 });
+        } catch (e2) {
+          if (e2.uncertain) uncertainOrders.set(order.idempotencyKey, Date.now());
+          throw e2;
+        }
+      } else if (!e.shopify) {
+        throw e; // throttle/budget: nothing was written, the app may retry
+      } else {
+        lastErr = e;
+        log('orderCreate attempt failed', JSON.stringify(e.shopify).slice(0, 600));
+        data = null;
+        continue;
+      }
     }
     const errs = data.orderCreate.userErrors;
     if (!errs.length) break;
@@ -3043,6 +3374,8 @@ async function createShopifyOrder(order, priced, { paid, gatewayRef, review, aqs
       (lastErr?.message || 'خطأ من إدارة المتجر') + (detail ? ` (${detail})` : ''));
   }
   const o = data.orderCreate.order;
+  bumpCustomerOrders(order.customer.phone);
+  dropMyOrders(o.customer?.id || existingId);
   if (consent) syncConsent(order.customer.phone, existingId || o.customer?.id || null);
   if (order.customer.phone && state.checkouts?.[order.customer.phone]) delete state.checkouts[order.customer.phone];
   if (disc?.appCode && state.appCodes?.[disc.code]) {
@@ -3250,13 +3583,103 @@ query CustomerByIdentifier($phone: String!) {
 /** The Shopify customer that owns exactly this phone. Exact lookup first
  *  (no search-index delay, so a customer made a minute ago is found and no
  *  duplicate is created); the fuzzy search is only a fallback. */
+const customerCache = new Map(); // phone -> {at, c}  (a customer's id never changes)
+const CUSTOMER_TTL = Number(env('CUSTOMER_CACHE_MS', String(24 * 3600e3)));
+const customerLookups = new Map(); // phone -> in-flight lookup
+function forgetCustomer(phone) {
+  if (!phone) return;
+  customerCache.delete(phone);
+  // The disk copy stays, but only as a fallback for busy moments.
+  const k = customerKnown.get(phone);
+  if (k) k.at = Math.min(k.at, Date.now() - CUSTOMER_TTL);
+}
+/** One more order: keep the copy, just count it (no new lookup needed). */
+function bumpCustomerOrders(phone) {
+  const h = customerCache.get(phone);
+  if (h?.c) h.c = { ...h.c, numberOfOrders: Number(h.c.numberOfOrders || 0) + 1 };
+  const k = customerKnown.get(phone);
+  if (k?.c) { k.c = { ...k.c, numberOfOrders: Number(k.c.numberOfOrders || 0) + 1 }; customerDirty = true; }
+}
+function rememberCustomer(phone, id) {
+  if (phone && id && CUSTOMER_TTL > 0) {
+    const c = { id, firstName: '', lastName: '', numberOfOrders: 0, defaultPhoneNumber: { phoneNumber: phone }, defaultEmailAddress: null };
+    customerCache.set(phone, { at: Date.now(), c });
+    knowCustomer(phone, c);
+  }
+}
+// Customers already identified are also kept on disk (customers.json), so a
+// restart or a rush of people not seen for a day doesn't ask Shopify for each
+// of them again. When Shopify is too busy, the last known copy is used.
+const CUSTOMER_FILE = path.join(CFG.dataDir, 'customers.json');
+const customerKnown = new Map(); // phone -> {at, c}  (on disk, up to 60 days)
+const CUSTOMER_KEEP = 60 * 86400e3;
+let customerDirty = false;
+try {
+  if (CUSTOMER_TTL > 0) {
+    for (const [ph, v] of Object.entries(JSON.parse(fs.readFileSync(CUSTOMER_FILE, 'utf8')))) {
+      if (Date.now() - v[5] > CUSTOMER_KEEP) continue;
+      customerKnown.set(ph, { at: v[5], c: { id: 'gid://shopify/Customer/' + v[0], firstName: v[1] || '', lastName: v[2] || '', numberOfOrders: v[4], defaultPhoneNumber: { phoneNumber: ph }, defaultEmailAddress: v[3] ? { emailAddress: v[3] } : null } });
+    }
+  }
+} catch {}
+function knowCustomer(phone, c) {
+  if (!c?.id || CUSTOMER_TTL <= 0) return;
+  customerKnown.delete(phone); // re-insert: newest last
+  customerKnown.set(phone, { at: Date.now(), c });
+  if (customerKnown.size > 300000) customerKnown.delete(customerKnown.keys().next().value);
+  customerDirty = true;
+}
+function saveKnownCustomers() {
+  if (!customerDirty) return;
+  customerDirty = false;
+  const out = {};
+  for (const [ph, { at, c }] of customerKnown) {
+    out[ph] = [c.id.split('/').pop(), c.firstName || '', c.lastName || '', c.defaultEmailAddress?.emailAddress || '', Number(c.numberOfOrders || 0), at];
+  }
+  try {
+    fs.writeFileSync(CUSTOMER_FILE + '.tmp', JSON.stringify(out));
+    fs.renameSync(CUSTOMER_FILE + '.tmp', CUSTOMER_FILE);
+  } catch (e) {
+    log('customers file', e.message);
+  }
+}
+setInterval(saveKnownCustomers, 60e3).unref();
+process.on('exit', saveKnownCustomers);
+setInterval(() => { for (const [k, v] of customerCache) if (Date.now() - v.at > CUSTOMER_TTL) customerCache.delete(k); }, 5 * 60e3).unref();
 async function customerByPhone(phone) {
   if (!phone) return null;
+  const hit = customerCache.get(phone);
+  if (hit && Date.now() - hit.at < CUSTOMER_TTL) { SHOP_GATE.stats.cacheHits++; return hit.c; }
+  const known = customerKnown.get(phone);
+  if (known && Date.now() - known.at < CUSTOMER_TTL) { SHOP_GATE.stats.cacheHits++; return known.c; }
+  // Shared only between callers of the same priority: a quick "low" lookup
+  // that gives up must not fail a customer screen that could have waited.
+  const lk = phone + '|' + (reqContext.getStore()?.prio || 'bg');
+  if (customerLookups.has(lk)) { SHOP_GATE.stats.coalesced++; return customerLookups.get(lk); }
+  const p = customerByPhoneLive(phone).then((c) => {
+    // Not found is kept only 20 s: a customer can appear any time (we drop it
+    // ourselves when we create one).
+    if (c || CUSTOMER_TTL > 0) customerCache.set(phone, { at: c ? Date.now() : Date.now() - CUSTOMER_TTL + 20e3, c });
+    if (c) knowCustomer(phone, c);
+    return c;
+  }, (e) => {
+    // Shopify busy: a customer's id never changes, the last known copy is fine.
+    if (e?.status === 503 && known && Date.now() - known.at < CUSTOMER_KEEP) {
+      SHOP_GATE.stats.servedStale = (SHOP_GATE.stats.servedStale || 0) + 1;
+      return known.c;
+    }
+    throw e;
+  }).finally(() => customerLookups.delete(lk));
+  customerLookups.set(lk, p);
+  return p;
+}
+async function customerByPhoneLive(phone) {
   try {
     const d = await admin(CUSTOMER_BY_IDENTIFIER, { phone });
     const c = d.customerByIdentifier;
     if (c && c.defaultPhoneNumber?.phoneNumber === phone) return c;
   } catch (e) {
+    if (e.status === 503) throw e; // busy: the fuzzy search would cost 4x more
     log('customerByIdentifier', String(e.message || e).slice(0, 160));
   }
   const found = await admin(CUSTOMER_BY_PHONE, { q: `phone:${phone}` });
@@ -3272,6 +3695,7 @@ async function customerIdByPhone(phone) {
 
 /** New phone: create its own customer (never merge into an email owner). */
 async function createCustomerForPhone(phone, name, email) {
+  forgetCustomer(phone);
   const [firstName, ...rest] = String(name || '').trim().split(/\s+/);
   const base = {
     phone,
@@ -3281,7 +3705,11 @@ async function createCustomerForPhone(phone, name, email) {
   for (const input of email ? [{ ...base, email }, base] : [base]) {
     const r = await admin(CUSTOMER_CREATE, { input });
     const id = r.customerCreate?.customer?.id;
-    if (id) return id;
+    if (id) {
+      rememberCustomer(phone, id);
+      spendCache.set(id, { at: Date.now(), v: { spent: 0, orders: 0 } }); // brand new: nothing spent yet
+      return id;
+    }
     log('customerCreate', JSON.stringify(r.customerCreate?.userErrors).slice(0, 300));
   }
   // "Phone has already been taken" (two requests at once): use that customer.
@@ -3300,6 +3728,11 @@ mutation WaConsent($input: CustomerWhatsAppMarketingConsentUpdateInput!) {
   customerWhatsAppMarketingConsentUpdate(input: $input) { userErrors { field message } }
 }`;
 const WA_TAG = 'موافق عروض واتساب';
+// The same tick also covers SMS offers (Shopify's official SMS consent field).
+const SMS_CONSENT = `
+mutation SmsConsent($input: CustomerSmsMarketingConsentUpdateInput!) {
+  customerSmsMarketingConsentUpdate(input: $input) { userErrors { field message } }
+}`;
 const CUSTOMER_UPDATE = `
 mutation CustomerUpdate($input: CustomerInput!) {
   customerUpdate(input: $input) { customer { id } userErrors { field message } }
@@ -3307,6 +3740,7 @@ mutation CustomerUpdate($input: CustomerInput!) {
 
 /** "حسابي → تعديل بياناتي": update the Shopify customer that owns this phone. */
 async function handleProfile(phone, body) {
+  forgetCustomer(phone);
   const name = String(body?.name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
   const email = String(body?.email || '').trim().slice(0, 120);
   if (name.length < 3) throw new AppError(400, 'اكتب اسمك الكامل');
@@ -3361,6 +3795,7 @@ function recordConsent(phone, agreed) {
 
 /** Pushes the saved consent to Shopify. Never throws (login/orders must not fail). */
 async function syncConsent(phone, customerId = null) {
+  forgetCustomer(phone);
   const c = state.consent?.[phone];
   if (!c || (c.synced && (!customerId || c.synced === customerId))) return;
   try {
@@ -3385,6 +3820,20 @@ async function syncConsent(phone, customerId = null) {
     });
     const errs = r.customerWhatsAppMarketingConsentUpdate?.userErrors || [];
     if (errs.length) log('whatsapp consent userErrors', JSON.stringify(errs).slice(0, 300));
+    if (bool('SMS_CONSENT_SYNC', true)) {
+      const r2 = await admin(SMS_CONSENT, {
+        input: {
+          customerId: id,
+          smsMarketingConsent: {
+            marketingState: c.wa ? 'SUBSCRIBED' : 'UNSUBSCRIBED',
+            marketingOptInLevel: 'SINGLE_OPT_IN',
+            consentUpdatedAt: c.at,
+          },
+        },
+      });
+      const e2 = r2.customerSmsMarketingConsentUpdate?.userErrors || [];
+      if (e2.length) log('sms consent userErrors', JSON.stringify(e2).slice(0, 300));
+    }
     c.synced = id;
     saveState();
   } catch (e) {
@@ -3636,6 +4085,152 @@ function openDoc(buf) {
   d.setAuthTag(buf.subarray(12, 28));
   return Buffer.concat([d.update(buf.subarray(28)), d.final()]);
 }
+
+// ---- copy of the ID photos on Amazon S3 (off the server's disk) ----------
+// Files stay encrypted with our own key (AES-256-GCM) before they leave; the
+// key itself is kept in Shopify (app backup), never next to the photos.
+// Needs: AQSATI_DOCS_S3_BUCKET and an IAM role on the EC2 server allowed to
+// s3:PutObject / GetObject / DeleteObject on that bucket. No keys in .env.
+const S3 = {
+  bucket: () => env('AQSATI_DOCS_S3_BUCKET', ''),
+  creds: null,
+  region: null,
+};
+const s3On = () => Boolean(S3.bucket());
+const IMDS = env('AWS_IMDS', 'http://169.254.169.254');
+async function imds(pathname) {
+  const tok = await fetch(IMDS + '/latest/api/token', {
+    method: 'PUT', headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' }, signal: AbortSignal.timeout(2000),
+  }).then((r) => r.text());
+  const r = await fetch(IMDS + pathname, { headers: { 'X-aws-ec2-metadata-token': tok }, signal: AbortSignal.timeout(2000) });
+  if (!r.ok) throw new Error('imds ' + r.status);
+  return r.text();
+}
+async function s3Creds() {
+  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    return { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY, token: process.env.AWS_SESSION_TOKEN || '' };
+  }
+  if (S3.creds && S3.creds.exp - Date.now() > 5 * 60e3) return S3.creds;
+  const role = (await imds('/latest/meta-data/iam/security-credentials/')).split('\n')[0].trim();
+  if (!role) throw new Error('no IAM role on this server');
+  const j = JSON.parse(await imds('/latest/meta-data/iam/security-credentials/' + role));
+  S3.creds = { id: j.AccessKeyId, secret: j.SecretAccessKey, token: j.Token, exp: Date.parse(j.Expiration) };
+  return S3.creds;
+}
+async function s3Region() {
+  if (S3.region) return S3.region;
+  S3.region = env('AWS_REGION', '') || (await imds('/latest/meta-data/placement/region')).trim();
+  return S3.region;
+}
+const sha256hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+/** One signed S3 request (AWS Signature V4). */
+async function s3Request(method, key, body = Buffer.alloc(0)) {
+  const [c, region] = await Promise.all([s3Creds(), s3Region()]);
+  const bucket = S3.bucket();
+  const custom = env('AQSATI_DOCS_S3_ENDPOINT', ''); // tests / S3-compatible stores (path style)
+  const base = custom ? new URL(custom) : new URL(`https://${bucket}.s3.${region}.amazonaws.com`);
+  const enc = (x) => encodeURIComponent(x).replace(/[!'()*]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+  const pathname = (custom ? '/' + enc(bucket) : '') + '/' + key.split('/').map(enc).join('/');
+  const now = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
+  const payloadHash = sha256hex(body);
+  const headers = { host: base.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': now };
+  if (method === 'PUT') headers['x-amz-server-side-encryption'] = 'AES256';
+  if (c.token) headers['x-amz-security-token'] = c.token;
+  headers.authorization = s3Sign(method, pathname, headers, payloadHash, c, region);
+  delete headers.host;
+  const r = await fetch(base.origin + pathname, { method, headers, body: method === 'PUT' ? body : undefined, signal: AbortSignal.timeout(30000) });
+  if (!r.ok && !(method === 'DELETE' && r.status === 404)) throw new Error(`s3 ${method} ${r.status}`);
+  return method === 'GET' ? Buffer.from(await r.arrayBuffer()) : null;
+}
+/** AWS Signature V4 "Authorization" header (headers must include host, x-amz-date). */
+function s3Sign(method, pathname, headers, payloadHash, c, region) {
+  const now = headers['x-amz-date'];
+  const day = now.slice(0, 8);
+  const names = Object.keys(headers).map((n) => n.toLowerCase()).sort();
+  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v).trim()]));
+  const canonical = [method, pathname, '', names.map((n) => `${n}:${lower[n]}\n`).join(''), names.join(';'), payloadHash].join('\n');
+  const scope = `${day}/${region}/s3/aws4_request`;
+  const toSign = ['AWS4-HMAC-SHA256', now, scope, sha256hex(canonical)].join('\n');
+  const kSign = hmac(hmac(hmac(hmac('AWS4' + c.secret, day), region), 's3'), 'aws4_request');
+  return `AWS4-HMAC-SHA256 Credential=${c.id}/${scope}, SignedHeaders=${names.join(';')}, Signature=${hmac(kSign, toSign).toString('hex')}`;
+}
+const s3DocKey = (id, kind) => `aqsati-docs/${id}/${kind}.bin`;
+
+/** Every 10 min: finished Aqsati files not yet on S3 are copied there. */
+let s3Busy = false;
+async function syncDocsToS3() {
+  if (!s3On() || s3Busy) return;
+  s3Busy = true;
+  try {
+    await backupDocsKey();
+    for (const [id, rec] of Object.entries(state.aqsatiDocs || {})) {
+      if (rec.s3) continue;
+      let ok = true;
+      for (const kind of Object.keys(rec.kinds || {})) {
+        try {
+          await s3Request('PUT', s3DocKey(id, kind), fs.readFileSync(path.join(docsDir(id), kind + '.bin')));
+        } catch (e) {
+          ok = false;
+          log('s3 put', id.slice(0, 6), kind, String(e.message || e).slice(0, 120));
+        }
+      }
+      if (ok) { rec.s3 = Date.now(); saveState(); }
+    }
+    state.s3 = { ok: true, at: new Date().toISOString() };
+  } catch (e) {
+    state.s3 = { ok: false, at: new Date().toISOString(), error: String(e.message || e).slice(0, 120) };
+    log('s3 sync', state.s3.error);
+  } finally {
+    s3Busy = false;
+  }
+}
+
+/** The photos' key, stored once in Shopify (readable only by this app). */
+async function backupDocsKey() {
+  if (state.docsKeySaved) return;
+  const owner = await appInstallationId();
+  const r = await admin(
+    `mutation K($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`,
+    { m: [{ ownerId: owner, namespace: BACKUP_NS, key: 'docs_key', type: 'single_line_text_field', value: docsKey().toString('hex') }] },
+    { prio: 'bg', retrySafe: true }
+  );
+  if (r.metafieldsSet?.userErrors?.length) throw new Error('docs key backup: ' + JSON.stringify(r.metafieldsSet.userErrors).slice(0, 120));
+  state.docsKeySaved = Date.now();
+  saveState();
+}
+/** Disk lost: take the key back from Shopify before a new one is made. */
+async function restoreDocsKey() {
+  const f = path.join(CFG.dataDir, 'aqsati-docs.key');
+  if (fs.existsSync(f) || !s3On()) return;
+  try {
+    const owner = await appInstallationId();
+    const d = await admin(`query K($id: ID!) { node(id: $id) { ... on AppInstallation { metafield(namespace: "${BACKUP_NS}", key: "docs_key") { value } } } }`, { id: owner }, { prio: 'bg' });
+    const v = d.node?.metafield?.value;
+    if (v && /^[a-f0-9]{64}$/.test(v)) {
+      fs.writeFileSync(f, v, { mode: 0o600 });
+      docsKeyCache = null;
+      log('docs key restored from Shopify');
+    }
+  } catch (e) {
+    log('docs key restore', String(e.message || e).slice(0, 120));
+  }
+}
+
+/** A photo: from the disk, or from S3 if the disk copy is gone. */
+async function readDocFile(id, kind) {
+  const f = path.join(docsDir(id), kind + '.bin');
+  try {
+    return fs.readFileSync(f);
+  } catch (e) {
+    if (!s3On() || !state.aqsatiDocs?.[id]?.s3) throw new AppError(404, 'الصورة غير موجودة');
+    const buf = await s3Request('GET', s3DocKey(id, kind));
+    fs.mkdirSync(docsDir(id), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(f, buf, { mode: 0o600 });
+    return buf;
+  }
+}
+
 const missingDocs = (p) => Object.keys(DOC_KINDS).filter((k) => !p.docs?.[k]);
 
 /** Step 2b: one photo (JPEG, base64) of the ID / residence card. */
@@ -3678,6 +4273,9 @@ function pruneAqsatiDocs() {
     const old = rec ? Date.now() - rec.at > keepDays * 86400e3 : !live.has(id) && age > 2 * 86400e3;
     if (old) {
       fs.rmSync(path.join(root, id), { recursive: true, force: true });
+      if (rec?.s3 && s3On()) {
+        for (const kind of Object.keys(rec.kinds || {})) s3Request('DELETE', s3DocKey(id, kind)).catch((e) => log('s3 delete', e.message));
+      }
       if (rec) delete state.aqsatiDocs[id];
     }
   }
@@ -3698,6 +4296,8 @@ async function aqsatiPlan(body, sessionPhone) {
     amount: plan.finalAmount,
     countOfMonth: plan.months,
   });
+  // The customer's tick under the photos ("these are mine, correct, I'm responsible").
+  if (body?.declared === true) p.declaredAt = Date.now();
   Object.assign(p, { stage: 'otp', plan, otpTries: 0 });
   saveState();
   return { ok: true, plan, message: 'أرسلت أقساطي رمز تحقق إلى جهازك المسجّل لديها' };
@@ -3734,6 +4334,7 @@ async function aqsatiConfirm(body, sessionPhone) {
         phone: p.order.customer.phone,
         identity: p.identity,
         kinds: p.docs,
+        declaredAt: p.declaredAt || null,
         at: Date.now(),
       };
     }
@@ -3937,7 +4538,20 @@ async function handleConfig() {
   };
 }
 
+const ordersInFlight = new Map(); // idempotency key -> promise
 async function handleOrder(body, ip, sessionPhone) {
+  const key = typeof body?.idempotencyKey === 'string' ? body.idempotencyKey : null;
+  // The same checkout sent twice at once (double tap, retry after a slow
+  // network): the second waits for the first instead of making another order.
+  if (key && ordersInFlight.has(key)) return ordersInFlight.get(key);
+  const p = handleOrderOnce(body, ip, sessionPhone);
+  if (key) {
+    ordersInFlight.set(key, p);
+    p.finally(() => ordersInFlight.delete(key)).catch(() => {});
+  }
+  return p;
+}
+async function handleOrderOnce(body, ip, sessionPhone) {
   if (otpEnabled() && !sessionPhone) throw new AppError(401, 'سجّل الدخول برقم هاتفك أولاً');
   assertOrdersOpen();
   const order = validateOrder(body);
@@ -4220,6 +4834,8 @@ const EDITABLE = [
   ['AQSATI_PLANS', 'خطط التقسيط أشهر:نسبة (10:25,18:40)', false],
   ['AQSATI_DOCS_REQUIRED', 'طلب صور البطاقة الوطنية وبطاقة السكن قبل رمز أقساطي', false],
   ['AQSATI_DOCS_DAYS', 'مدة الاحتفاظ بصور المستمسكات (أيام، الافتراضي 365)', false],
+  ['AQSATI_DOCS_S3_BUCKET', 'اسم حاوية S3 لنسخة صور المستمسكات (فارغ = بدون نسخة)', false],
+  ['SHOPIFY_WEBHOOKS', 'إشعارات شوبيفاي الفورية لتغيّر الطلبات (true/false)', false],
 ];
 
 function adminPassOk(given) {
@@ -4306,8 +4922,11 @@ mutation ReviewUpdate($id: ID!, $m: MetaobjectUpdateInput!) {
 }`;
 
 let reviewsCache = { at: 0, list: null };
-async function allReviews(force = false) {
-  if (!force && reviewsCache.list && Date.now() - reviewsCache.at < 5 * 60e3) return reviewsCache.list;
+function allReviews(force = false) {
+  if (!force && reviewsCache.list && Date.now() - reviewsCache.at < 5 * 60e3) return Promise.resolve(reviewsCache.list);
+  return force ? loadReviews(true) : singleFlight('reviews', () => loadReviews(false));
+}
+async function loadReviews(force) {
   const list = [];
   let after = null;
   for (let page = 0; page < 20; page++) {
@@ -4335,8 +4954,11 @@ async function allReviews(force = false) {
 }
 
 let quoliCache = { at: 0, map: null };
-async function quoliRatings() {
-  if (quoliCache.map && Date.now() - quoliCache.at < 30 * 60e3) return quoliCache.map;
+function quoliRatings() {
+  if (quoliCache.map && Date.now() - quoliCache.at < 30 * 60e3) return Promise.resolve(quoliCache.map);
+  return singleFlight('quoli', loadQuoli);
+}
+async function loadQuoli() {
   const map = {};
   let after = null;
   for (let page = 0; page < 20; page++) {
@@ -4386,7 +5008,7 @@ async function handleRatings() {
 async function deliveredPurchase(phone, handle) {
   const c = await customerByPhone(phone);
   if (!c) return null;
-  const d = await admin(MY_ORDERS_QUERY, { q: `customer_id:${c.id.split('/').pop()}` });
+  const d = await myOrders(c.id.split('/').pop());
   for (const o of d.orders?.nodes || []) {
     if (orderStep(o).step !== 4) continue;
     const li = (o.lineItems?.nodes || []).find((x) => x.product?.handle === handle);
@@ -4897,6 +5519,12 @@ function adminState() {
       backup: state.backup || null,
       disk: diskInfo(),
       crashCount: (state.crashes || []).reduce((a, c) => a + c.count, 0),
+      webhooks: state.webhooks || null,
+      docsS3: s3On() ? { ...(state.s3 || {}), copied: Object.values(state.aqsatiDocs || {}).filter((r) => r.s3).length, total: Object.keys(state.aqsatiDocs || {}).length } : null,
+      shopify: {
+        points: Math.round(gatePoints()), max: SHOP_GATE.max, restore: SHOP_GATE.restore,
+        waiting: SHOP_GATE.queue.length, inFlight: SHOP_GATE.inFlight, ...SHOP_GATE.stats,
+      },
       abandon: CFG.abandon.enabled,
       ordersPaused: ordersPaused(),
       owner: { phones: ownerPhones().length, devices: tokensOf(ownerPhones()).length, report: state.ownerReport || null, stock: state.stockCheck || null },
@@ -5243,7 +5871,7 @@ async function adminSendPush(body) {
 }
 
 // Aqsati ID photos: list, one customer, one photo. Admin login only.
-function adminDocs(req, res, p, url) {
+async function adminDocs(req, res, p, url) {
   const secure = { 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Robots-Tag': 'noindex' };
   if (!adminSessionOk(req)) {
     res.writeHead(302, { Location: '/admin', ...secure });
@@ -5258,7 +5886,7 @@ function adminDocs(req, res, p, url) {
     const pend = Object.values(state.pending || {}).find((x) => x.docId === id);
     const type = (rec?.kinds || pend?.docs || {})[kind];
     if (!DOC_KINDS[kind] || !type) throw new AppError(404, 'غير موجود');
-    const img = openDoc(fs.readFileSync(path.join(docsDir(id), kind + '.bin')));
+    const img = openDoc(await readDocFile(id, kind));
     log('admin: docs view', id.slice(0, 6), kind);
     res.writeHead(200, { 'Content-Type': type === 'png' ? 'image/png' : 'image/jpeg', ...secure });
     return res.end(img);
@@ -5274,11 +5902,15 @@ function adminDocs(req, res, p, url) {
     const head = rec
       ? `<h1>طلب ${esc(rec.orderName)} — ${esc(rec.name)}</h1><div class="mu">${esc(String(rec.phone).replace('+964', '0'))} · حساب أقساطي ${esc(rec.identity)} · ${new Date(rec.at).toLocaleString('ar-IQ', { timeZone: 'Asia/Baghdad' })}</div>`
       : `<h1>${esc(pend.order.customer.name)} (لم يكتمل الطلب)</h1>`;
+    const dAt = rec?.declaredAt || pend?.declaredAt;
+    const decl = dAt
+      ? `<div class="mu" style="color:#22c55e;margin-top:6px">✓ أقرّ الزبون بصحة المستمسكات ومسؤوليته عنها — ${new Date(dAt).toLocaleString('ar-IQ', { timeZone: 'Asia/Baghdad' })}</div>`
+      : '<div class="mu" style="margin-top:6px">— لا يوجد إقرار مسجّل (نسخة تطبيق قديمة)</div>';
     const figs = Object.keys(DOC_KINDS)
       .filter((k) => kinds[k])
       .map((k) => `<figure><a href="/admin/docs/${id}/${k}" target="_blank"><img loading="lazy" src="/admin/docs/${id}/${k}" alt=""></a><figcaption>${esc(DOC_KINDS[k])}</figcaption></figure>`)
       .join('');
-    return res.end(page('مستمسكات', `<a class="back" href="/admin/docs">‹ كل المستمسكات</a>${head}<div class="grid" style="margin-top:14px">${figs}</div>`));
+    return res.end(page('مستمسكات', `<a class="back" href="/admin/docs">‹ كل المستمسكات</a>${head}${decl}<div class="grid" style="margin-top:14px">${figs}</div>`));
   }
   const q = String(url.searchParams.get('q') || '').trim();
   const list = Object.entries(state.aqsatiDocs || {})
@@ -5585,12 +6217,23 @@ function checkAppKey(req) {
   }
 }
 
-const server = http.createServer((req, res) => reqContext.run({ device: deviceFromHeader(req) }, () => handleRequest(req, res)));
+// Which Shopify queue a request waits in (see the Admin gateway): placing or
+// paying an order goes first; the name shown after login is a nice-to-have.
+function shopPrioOf(req) {
+  const u = String(req.url || '').split('?')[0];
+  if (req.method === 'POST' && (u === '/api/orders' || u === '/api/orders/cancel' || u.startsWith('/api/aqsati/'))) return { prio: 'order' };
+  if (u.startsWith('/pay/')) return { prio: 'order' };
+  if (u === '/api/auth/otp/verify' || u === '/api/auth/me') return { prio: 'low', budgetMs: 4000 };
+  if (u.startsWith('/admin')) return { prio: 'ui', budgetMs: 30000 };
+  return { prio: 'ui' };
+}
+const server = http.createServer((req, res) => reqContext.run({ device: deviceFromHeader(req), ...shopPrioOf(req) }, () => handleRequest(req, res)));
 async function handleRequest(req, res) {
   const url = new URL(req.url, 'http://local');
   const p = url.pathname.replace(/\/+$/, '') || '/';
   try {
-    if (req.method === 'GET' && p === '/health') return send(res, 200, { ok: true });
+    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/health') return send(res, 200, { ok: true });
+    if (req.method === 'POST' && p === WEBHOOK_PATH) return await handleWebhook(req, res);
     // Al-Waseet governorates and regions for the website's cart (public, cached).
     if (req.method === 'GET' && p === '/waseet.json') {
       const body = (send.waseet = send.waseet || JSON.stringify(WASEET.map((c) => [c.id, c.name, c.regions])));
@@ -6005,6 +6648,99 @@ async function handleRequest(req, res) {
   }
 }
 
+// -------------------------------------------------------------- webhooks ---
+// Shopify tells us the moment an order changes (shipped, Al-Waseet tag,
+// delivered, cancelled) instead of us asking every 1–2 minutes. The server
+// subscribes its own app ("Ji Fire Order") at start; the pollers stay as a
+// safety net. Every call is checked with the app's secret (HMAC).
+const WEBHOOK_PATH = '/webhooks/shopify';
+const WEBHOOK_TOPICS = ['ORDERS_UPDATED', 'ORDERS_CANCELLED'];
+const webhooksOn = () => bool('SHOPIFY_WEBHOOKS', true) && Boolean(CFG.clientSecret) && /^https:\/\//.test(CFG.publicUrl || '');
+
+function webhookValid(raw, hmac) {
+  if (!CFG.clientSecret || !hmac) return false;
+  const want = crypto.createHmac('sha256', CFG.clientSecret).update(Buffer.from(raw, 'utf8')).digest();
+  let got;
+  try { got = Buffer.from(String(hmac), 'base64'); } catch { return false; }
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+// A rush of changes runs the existing checks once, at most every 15 s.
+let webhookTimer = null;
+let webhookLast = 0;
+function webhookKick() {
+  if (webhookTimer) return;
+  const wait = Math.max(3000, 15000 - (Date.now() - webhookLast));
+  webhookTimer = setTimeout(async () => {
+    webhookTimer = null;
+    webhookLast = Date.now();
+    for (const job of [checkFulfilledOrders, checkLoyalty]) {
+      try { await job(); } catch (e) { log('webhook job', String(e.message || e).slice(0, 160)); }
+    }
+  }, wait);
+  webhookTimer.unref?.();
+}
+
+async function handleWebhook(req, res) {
+  const raw = await readBody(req, 2 * 1024 * 1024);
+  if (!webhookValid(raw, req.headers['x-shopify-hmac-sha256'])) return send(res, 401, { error: 'bad signature' });
+  // Answer at once (Shopify waits 5 s at most), work afterwards.
+  send(res, 200, { ok: true });
+  state.webhooks = state.webhooks || {};
+  state.webhooks.lastAt = new Date().toISOString();
+  state.webhooks.count = (state.webhooks.count || 0) + 1;
+  try {
+    const o = JSON.parse(raw);
+    const cid = o?.customer?.id || o?.customer?.admin_graphql_api_id;
+    if (cid) {
+      const gid = String(cid).startsWith('gid://') ? cid : `gid://shopify/Customer/${cid}`;
+      dropMyOrders(gid);
+      spendCache.delete(gid);
+    }
+  } catch {}
+  webhookKick();
+}
+
+const WEBHOOK_LIST = `
+query WebhookList { webhookSubscriptions(first: 50) { nodes { id topic uri } } }`;
+const WEBHOOK_CREATE = `
+mutation WebhookCreate($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
+  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+    webhookSubscription { id }
+    userErrors { field message }
+  }
+}`;
+const WEBHOOK_DELETE = `
+mutation WebhookDelete($id: ID!) { webhookSubscriptionDelete(id: $id) { userErrors { message } } }`;
+
+/** Makes sure our two subscriptions point at this server (and only there). */
+async function ensureWebhooks() {
+  if (!webhooksOn()) return;
+  const uri = CFG.publicUrl.replace(/\/$/, '') + WEBHOOK_PATH;
+  try {
+    const d = await admin(WEBHOOK_LIST, {}, { prio: 'bg' });
+    const subs = d.webhookSubscriptions?.nodes || [];
+    for (const s1 of subs) {
+      // Ours, but for an old address (e.g. the server's IP changed): remove.
+      if (s1.uri && s1.uri.endsWith(WEBHOOK_PATH) && s1.uri !== uri) {
+        await admin(WEBHOOK_DELETE, { id: s1.id }, { prio: 'bg', retrySafe: true }).catch(() => {});
+      }
+    }
+    for (const topic of WEBHOOK_TOPICS) {
+      if (subs.some((x) => x.topic === topic && x.uri === uri)) continue;
+      const r = await admin(WEBHOOK_CREATE, { topic, sub: { uri, format: 'JSON', includeFields: ['id', 'updated_at', 'customer'] } }, { prio: 'bg' });
+      const errs = r.webhookSubscriptionCreate?.userErrors || [];
+      if (errs.length) log('webhook create', topic, JSON.stringify(errs).slice(0, 200));
+      else log('webhook on', topic);
+    }
+    state.webhooks = { ...(state.webhooks || {}), uri, ok: true, checkedAt: new Date().toISOString() };
+    saveState();
+  } catch (e) {
+    log('webhooks', String(e.message || e).slice(0, 200));
+    state.webhooks = { ...(state.webhooks || {}), ok: false, error: String(e.message || e).slice(0, 120) };
+  }
+}
+
 function redirect(res, location) {
   res.writeHead(302, { Location: location, 'Cache-Control': 'no-store' });
   res.end();
@@ -6020,10 +6756,17 @@ if (require.main === module) {
   if (missing.length) console.warn('⚠️  Missing settings:', missing.join(', '));
   if (!CFG.appKey) console.warn('⚠️  APP_KEY is empty: anyone can call /api/orders');
   // Only Caddy (on this machine) talks to Node; never reachable from outside.
+  // Subscribe to order changes a little after start, then check twice a day.
+  setTimeout(() => ensureWebhooks(), 20e3).unref();
+  // ID photos: key back from Shopify if the disk was replaced, then copy to S3.
+  setTimeout(() => restoreDocsKey().then(() => setTimeout(syncDocsToS3, 30e3)), 1000).unref();
+  setInterval(() => syncDocsToS3(), 10 * 60e3).unref();
+  setInterval(() => ensureWebhooks(), 12 * 3600e3).unref();
   server.listen(CFG.port, env('HOST', '127.0.0.1'), () => {
     log(`Ji Fire order server on :${CFG.port} | card payments: ${hyperpayEnabled() ? 'on' : 'off'} | OTP login: ${otpEnabled() ? 'on' : 'off'}`);
   });
 }
 
 module.exports = {
+  s3Sign, webhookValid, s3Request,
   appFlags, dailySummary, waseetInfo, orderStep, orderStage, updateUrlFor, waseetTimeline, noteWaseet, checkLowStock, checkOwnerReport, summaryMessage, stockMessage, runBackup, restoreFromShopify, pruneState, recordCrash, checkAbandoned, checkWheelPush, _state: () => state, handleWatch, versionLess, server, normalizePhone, validateOrder, parseFees, CFG, signSession, parseSocialLinks, referralCode, customerFromCode, setEntry, ledgerBalance };
