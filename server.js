@@ -2837,7 +2837,7 @@ query MyOrders($q: String!) {
       customAttributes { key value }
       customer { id }
       shippingAddress { city address1 }
-      lineItems(first: 6) { nodes { title quantity image { url } product { id handle } } }
+      lineItems(first: 6) { nodes { title quantity image { url } product { id handle } variant { id } } }
       fulfillments(first: 3) { createdAt deliveredAt inTransitAt }
     }
   }
@@ -3036,7 +3036,7 @@ async function handleMyOrders(phone) {
         deliveryLog: waseetTimeline(o.id),
         canCancel: canCustomerCancel(o),
         cancelUntil: new Date(Date.parse(o.createdAt) + cancelWindowMs()).toISOString(),
-        items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null })),
+        items: (o.lineItems?.nodes || []).map((li) => ({ title: li.title, quantity: li.quantity, image: li.image?.url || null, handle: li.product?.handle || null, variantId: li.variant?.id || null })),
       };
     }),
   };
@@ -6757,14 +6757,24 @@ async function ensureWebhooks() {
         await admin(WEBHOOK_DELETE, { id: s1.id }, { prio: 'bg', retrySafe: true }).catch(() => {});
       }
     }
+    const problems = [];
     for (const topic of WEBHOOK_TOPICS) {
       if (subs.some((x) => x.topic === topic && x.uri === uri)) continue;
       const r = await admin(WEBHOOK_CREATE, { topic, sub: { uri, format: 'JSON', includeFields: ['id', 'updated_at', 'customer'] } }, { prio: 'bg' });
       const errs = r.webhookSubscriptionCreate?.userErrors || [];
-      if (errs.length) log('webhook create', topic, JSON.stringify(errs).slice(0, 200));
-      else log('webhook on', topic);
+      if (errs.length) {
+        // Usually: the app lacks "protected customer data" access for orders.
+        log('webhook create', topic, JSON.stringify(errs).slice(0, 200));
+        problems.push(`${topic}: ${errs.map((e) => e.message).join('; ')}`.slice(0, 160));
+      } else log('webhook on', topic);
     }
-    state.webhooks = { ...(state.webhooks || {}), uri, ok: true, checkedAt: new Date().toISOString() };
+    state.webhooks = {
+      ...(state.webhooks || {}),
+      uri,
+      ok: problems.length === 0,
+      error: problems.length ? problems.join(' | ') : undefined,
+      checkedAt: new Date().toISOString(),
+    };
     saveState();
   } catch (e) {
     log('webhooks', String(e.message || e).slice(0, 200));
