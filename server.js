@@ -4909,6 +4909,7 @@ query QuoliRatings($after: String) {
       rating: metafield(namespace: "reviews", key: "rating") { value }
       count: metafield(namespace: "reviews", key: "rating_count") { value }
       widget: metafield(namespace: "quoli-ugc", key: "reviewWidget") { value }
+      snap: metafield(namespace: "quoli-ugc", key: "aiSnapshot") { value }
     }
   }
 }`;
@@ -4958,8 +4959,16 @@ function quoliRatings() {
   if (quoliCache.map && Date.now() - quoliCache.at < 30 * 60e3) return Promise.resolve(quoliCache.map);
   return singleFlight('quoli', loadQuoli);
 }
+/** A store reviewer's name as the app shows it: first name only; an email,
+ *  a phone number or anything odd becomes "زبون". */
+function reviewerName(a) {
+  const s = String(a || '').trim();
+  if (!s || /@|\d{3,}|https?:/i.test(s)) return 'زبون';
+  return s.split(/\s+/)[0].slice(0, 20);
+}
 async function loadQuoli() {
   const map = {};
+  const texts = {}; // handle -> reviews written on the website (Quoli)
   let after = null;
   for (let page = 0; page < 20; page++) {
     const d = await admin(QUOLI_QUERY, { after });
@@ -4978,11 +4987,26 @@ async function loadQuoli() {
         } catch {}
       }
       if (avg > 0 && count > 0) map[n.handle] = [avg, count];
+      try {
+        const snap = n.snap?.value ? JSON.parse(n.snap.value) : null;
+        const list = (snap?.reviews || [])
+          .map((r) => ({
+            name: reviewerName(r.author),
+            rating: Math.max(1, Math.min(5, Math.round(Number(r.rating) || 0))),
+            title: String(r.title || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+            comment: String(r.body || '').replace(/\s+/g, ' ').trim().slice(0, 600),
+            at: /^\d{4}-\d{2}-\d{2}/.test(String(r.date || '')) ? String(r.date).slice(0, 10) : null,
+            verified: r.verified === true,
+            source: 'store',
+          }))
+          .filter((r) => r.rating && (r.comment || r.title));
+        if (list.length) texts[n.handle] = list.slice(0, 30);
+      } catch {}
     }
     if (!d.products?.pageInfo?.hasNextPage) break;
     after = d.products.pageInfo.endCursor;
   }
-  quoliCache = { at: Date.now(), map };
+  quoliCache = { at: Date.now(), map, texts };
   return map;
 }
 
@@ -5034,12 +5058,19 @@ async function handleReviews(handle, phone) {
     } catch {}
   }
   const [average, count] = ratings.ratings[handle] || [0, 0];
+  const app = shown.map((r) => ({ name: r.name || 'زبون', rating: r.rating, comment: r.comment, at: r.at, verified: true, source: 'app' }));
+  const store = quoliCache.texts?.[handle] || [];
+  // Newest first, app and website together.
+  const list = [...app, ...store].sort((a, b) => String(b.at || '').localeCompare(String(a.at || ''))).slice(0, 30);
+  const dist = [0, 0, 0, 0, 0]; // 5★ .. 1★, from the written reviews
+  for (const r of [...app, ...store]) if (r.rating >= 1 && r.rating <= 5) dist[5 - r.rating]++;
   return {
     average,
     count,
+    dist,
     canReview: can,
     mine: my,
-    reviews: shown.slice(0, 30).map((r) => ({ name: r.name || 'زبون', rating: r.rating, comment: r.comment, at: r.at })),
+    reviews: list,
   };
 }
 
