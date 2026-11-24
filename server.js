@@ -1713,7 +1713,7 @@ async function checkFulfilledOrders() {
                 title: `تحديث توصيل طلبك ${o.name} 🚚`,
                 body: st.waseet.msg,
                 dataOnly: true,
-                data: { type: 'order', status: st.status, step: st.step, order: o.name, delivery: st.waseet.msg },
+                data: { type: 'order', status: st.status, step: st.step, stage: pushStage(o, st), order: o.name, delivery: st.waseet.msg },
               });
               if (r === 'invalid') unregisterPushToken(dev.token);
               log('waseet push', o.name, st.waseet.kind, ph.slice(-4), r);
@@ -1752,7 +1752,7 @@ async function checkFulfilledOrders() {
           const r = await sendPush(dev.token, {
             ...msg,
             dataOnly: true,
-            data: { type: 'order', status: st.status, step: st.step, order: o.name },
+            data: { type: 'order', status: st.status, step: st.step, stage: pushStage(o, st), order: o.name },
           });
           if (r === 'invalid') unregisterPushToken(dev.token);
           log('order push', o.name, ph.slice(-4), r);
@@ -3014,6 +3014,15 @@ function orderStep(o) {
 const STAGE_OF_KIND = { active: 2, handed: 2, picked: 3, transit: 4, office: 5, out: 6, delivered: 7 };
 const HOLD_KINDS = new Set(['postponed', 'closed', 'noanswer', 'notice', 'badphone', 'address', 'refused', 'other']);
 const HOLD_LABEL = { postponed: 'مؤجل', closed: 'الجوال مغلق', noanswer: 'لا يرد', notice: 'تبليغ', badphone: 'الرقم معطل', address: 'تأكيد العنوان', refused: 'ملاحظة' };
+/** The 7-stage position for the app's live banner ('' when unknown). */
+function pushStage(o, st) {
+  try {
+    return String(orderStage(o, st).stage);
+  } catch {
+    return '';
+  }
+}
+
 function orderStage(o, st) {
   st = st || orderStep(o);
   const pickup = (o.tags || []).some((t) => String(t).includes('استلام من المتجر'));
