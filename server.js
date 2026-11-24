@@ -2629,6 +2629,46 @@ async function handleReferral(phone, body) {
 }
 
 /** Cash-on-delivery order paid partly with points (atomic per customer). */
+/**
+ * Points as a discount for card and Aqsati orders: checked and priced now,
+ * deducted when the Shopify order is created (after payment / approval).
+ * Cash on delivery keeps placeOrderWithPoints (deducts at once).
+ */
+async function applyPointsDiscount(order, priced) {
+  if (!order.usePoints) return null;
+  if (!LOY.enabled) throw new AppError(400, 'نظام النقاط غير مفعّل');
+  if (order.discountCode) throw new AppError(400, 'لا يمكن استخدام النقاط مع كود خصم في نفس الطلب');
+  const cid = await customerIdByPhone(order.customer.phone);
+  if (!cid) throw new AppError(400, 'رصيد نقاطك غير كافٍ');
+  const { ledger } = await loadLedger(cid);
+  const balance = redeemableBalance(ledger);
+  const maxPts = Math.floor((priced.subtotal * LOY.maxRedeemPct) / 100 / LOY.pointValue);
+  const points = Math.min(balance, maxPts);
+  if (balance < LOY.minRedeem || points <= 0) {
+    throw new AppError(400, lockedWheelPoints(ledger) ? 'نقاط عجلة الحظ تُفعّل بعد استلام أول طلب لك' : 'رصيد نقاطك غير كافٍ');
+  }
+  priced.discount = { code: 'JIFIRE-POINTS', title: 'نقاط الولاء', amount: points * LOY.pointValue, points, freeShipping: false };
+  return { cid, points };
+}
+
+/** The order with points now exists: take them off the balance. */
+async function recordPointsRedeem(order, priced, created) {
+  const points = priced?.discount?.code === 'JIFIRE-POINTS' ? Number(priced.discount.points) || 0 : 0;
+  if (!points) return;
+  try {
+    const cid = created.customerId || (await customerIdByPhone(order.customer.phone));
+    if (!cid) return;
+    await withLoyaltyLock(cid, async () => {
+      const { ledger } = await loadLedger(cid);
+      if (redeemableBalance(ledger) < points) log('points redeemed above balance', created.orderName, points);
+      if (setEntry(ledger, 'redeem:' + created.orderId, -points, { t: 'redeem', o: created.orderName })) await saveLedger(cid, ledger);
+    });
+  } catch (e) {
+    // The order carries jifire_points_redeemed: the next sync records it.
+    log('ledger save after paid order failed', String(e.message || e).slice(0, 200));
+  }
+}
+
 async function placeOrderWithPoints(order) {
   if (!LOY.enabled) throw new AppError(400, 'نظام النقاط غير مفعّل');
   if (order.discountCode) throw new AppError(400, 'لا يمكن استخدام النقاط مع كود خصم في نفس الطلب');
@@ -4016,6 +4056,7 @@ async function aqsatiStart(body, ip, sessionPhone) {
   if (sessionPhone) order.customer.phone = sessionPhone;
   rateLimit(ip, 'aqsati-start', 10, 10 * 60e3);
   const priced = await priceOrder(order);
+  await applyPointsDiscount(order, priced);
   const { fee, total: amount } = orderTotals(order, priced);
   const ref = 'AQ' + crypto.randomBytes(12).toString('base64url');
   state.pending[ref] = { kind: 'aqsati', at: Date.now(), order, priced, amount, stage: 'identity', tries: 0 };
@@ -4326,6 +4367,7 @@ async function aqsatiConfirm(body, sessionPhone) {
       aqsati: { plan: p.plan, installmentId: inst?.installmentId, identity: p.identity, docId: p.docId },
     });
     Object.assign(p, { stage: 'done', orderName: created.orderName });
+    await recordPointsRedeem(p.order, p.priced, created);
     if (p.docId) {
       state.aqsatiDocs = state.aqsatiDocs || {};
       state.aqsatiDocs[p.docId] = {
@@ -4568,7 +4610,7 @@ async function handleOrderOnce(body, ip, sessionPhone) {
   rateLimit(ip, 'order', CFG.ordersPerIp, 10 * 60e3);
   rateLimit(order.customer.phone, 'order-phone', 4, 10 * 60e3);
 
-  if (order.usePoints) {
+  if (order.usePoints && order.payment === 'cod') {
     const result = await placeOrderWithPoints(order);
     state.idempotency[order.idempotencyKey] = { at: Date.now(), result };
     saveState();
@@ -4576,6 +4618,8 @@ async function handleOrderOnce(body, ip, sessionPhone) {
   }
 
   const priced = await priceOrder(order);
+  // Card / Aqsati with points: priced here, deducted once the order exists.
+  await applyPointsDiscount(order, priced);
   const { fee, discount, total } = orderTotals(order, priced);
 
   let result;
@@ -4713,6 +4757,7 @@ async function handlePayResult(token) {
       review: !success,
     });
     Object.assign(p, { status: 'done', orderName: created.orderName, review: !success });
+    await recordPointsRedeem(p.order, priced, created);
     state.idempotency[p.order.idempotencyKey] = {
       at: Date.now(),
       result: { status: 'created', orderName: created.orderName, total: created.total, currency: created.currency },
