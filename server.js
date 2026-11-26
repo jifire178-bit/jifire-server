@@ -4594,6 +4594,45 @@ async function handleStock(handle) {
   return { stock };
 }
 
+// Account deletion (Google Play requirement). Hard-deletes the Shopify
+// customer when possible; if they have orders Shopify must keep, flags the
+// record for erasure instead. Either way, every app-side trace is removed.
+async function handleAccountDelete(phone) {
+  if (!phone) throw new AppError(401, 'login');
+  let mode = 'deleted';
+  const c = await customerByPhone(phone).catch(() => null);
+  if (c?.id) {
+    const r = await admin(
+      `mutation DelCust($id: ID!){ customerDelete(input:{id:$id}){ deletedCustomerId userErrors{ message } } }`,
+      { id: c.id },
+      { mutation: true },
+    ).catch((e) => ({ _err: String(e?.message || e) }));
+    const deleted = r?.customerDelete?.deletedCustomerId;
+    if (!deleted) {
+      // Usually: the customer has orders Shopify keeps for its records.
+      // Flag for erasure and strip our own copy of their data.
+      mode = 'requested';
+      try {
+        await admin(
+          `mutation T($id: ID!, $tags: [String!]!){ tagsAdd(id: $id, tags: $tags){ userErrors { message } } }`,
+          { id: c.id, tags: ['DELETION_REQUESTED'] },
+          { mutation: true },
+        );
+      } catch (e) {
+        log('delete-tag failed', String(e?.message || e).slice(0, 120));
+      }
+    }
+    try { ledgerCache.delete(c.id); spendCache.delete(c.id); dropMyOrders(c.id); } catch {}
+  }
+  try { forgetCustomer(phone); } catch {}
+  try { if (state.push) delete state.push[phone]; } catch {}
+  try { if (state.consent) delete state.consent[phone]; } catch {}
+  try { if (state.waOtp) delete state.waOtp[phone]; } catch {}
+  try { saveState(); } catch {}
+  log('account delete', phone, mode);
+  return { ok: true, mode };
+}
+
 async function handleConfig() {
   return {
     currency: 'IQD',
@@ -6462,6 +6501,11 @@ async function handleRequest(req, res) {
     if (req.method === 'GET' && p === '/api/stock') {
       checkAppKey(req);
       return send(res, 200, await handleStock(url.searchParams.get('handle')));
+    }
+
+    if (req.method === 'POST' && p === '/api/account/delete') {
+      checkAppKey(req);
+      return send(res, 200, await handleAccountDelete(readSession(req)));
     }
 
     if (req.method === 'POST' && p === '/api/orders') {
