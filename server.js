@@ -2799,7 +2799,8 @@ async function checkWatches() {
   }
 }
 if (require.main === module || process.env.WATCH_INTERVAL_MS) {
-  setInterval(checkWatches, Number(env('WATCH_INTERVAL_MS', String(10 * 60e3)))).unref();
+  // Back-in-stock / price-drop alerts: check every minute by default.
+  setInterval(checkWatches, Number(env('WATCH_INTERVAL_MS', String(60e3)))).unref();
 }
 
 /** Sends the due "rate your product" pushes (once per delivered order). */
@@ -2824,7 +2825,7 @@ async function checkReviewAsks() {
   saveState();
 }
 if (require.main === module || process.env.WATCH_INTERVAL_MS) {
-  setInterval(() => checkReviewAsks().catch(() => {}), Number(env('WATCH_INTERVAL_MS', String(10 * 60e3)))).unref();
+  setInterval(() => checkReviewAsks().catch(() => {}), Number(env('REVIEW_ASK_INTERVAL_MS', String(10 * 60e3)))).unref();
 }
 
 // Share links: https://<server>/p/<handle> opens the app when installed
