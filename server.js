@@ -4545,6 +4545,55 @@ setInterval(() => {
 
 // -------------------------------------------------------------- handlers ---
 
+// Available stock per variant for one product, so the app can cap the
+// quantity a customer may add instead of failing at checkout. Needs the
+// Admin `read_inventory` scope; without it Shopify errors and we simply
+// return an empty map (the app then applies no cap, nothing breaks).
+const STOCK_CACHE = new Map(); // handle -> { at, data }
+const STOCK_TTL = 60e3;
+async function handleStock(handle) {
+  handle = String(handle || '').trim().toLowerCase();
+  if (!handle || handle.length > 200) return { stock: {} };
+  const hit = STOCK_CACHE.get(handle);
+  if (hit && Date.now() - hit.at < STOCK_TTL) return { stock: hit.data };
+  let stock = {};
+  try {
+    const data = await adminCall(
+      `query($q:String!){
+        products(first:1, query:$q){
+          nodes {
+            variants(first:100){
+              nodes {
+                id
+                inventoryQuantity
+                inventoryPolicy
+                inventoryItem { tracked }
+              }
+            }
+          }
+        }
+      }`,
+      { q: `handle:${handle}` },
+      {},
+    );
+    const node = data?.products?.nodes?.[0];
+    for (const v of node?.variants?.nodes || []) {
+      const tracked = v?.inventoryItem?.tracked === true;
+      const denies = String(v?.inventoryPolicy || '').toUpperCase() === 'DENY';
+      // Cap only when inventory is tracked and overselling is off.
+      if (tracked && denies) {
+        stock[v.id] = Math.max(0, Number(v.inventoryQuantity) || 0);
+      }
+    }
+  } catch (e) {
+    // Missing scope or any Shopify error: no cap, never break the app.
+    log('stock lookup failed', handle, String(e?.message || e).slice(0, 120));
+    stock = {};
+  }
+  STOCK_CACHE.set(handle, { at: Date.now(), data: stock });
+  return { stock };
+}
+
 async function handleConfig() {
   return {
     currency: 'IQD',
@@ -6408,6 +6457,11 @@ async function handleRequest(req, res) {
     if (req.method === 'GET' && p === '/api/config') {
       checkAppKey(req);
       return send(res, 200, await handleConfig());
+    }
+
+    if (req.method === 'GET' && p === '/api/stock') {
+      checkAppKey(req);
+      return send(res, 200, await handleStock(url.searchParams.get('handle')));
     }
 
     if (req.method === 'POST' && p === '/api/orders') {
