@@ -3538,9 +3538,24 @@ const SESSION_SECRET = (() => {
   }
 })();
 
+// Per-phone session version. Bumping it (e.g. on account deletion) revokes
+// every token issued for that phone. Missing/old tokens default to 0, so this
+// is fully backward compatible — existing sessions keep working.
+function sessionVer(phone) {
+  return (state.sessionVer && state.sessionVer[phone]) || 0;
+}
+function bumpSessionVer(phone) {
+  if (!state.sessionVer) state.sessionVer = {};
+  state.sessionVer[phone] = sessionVer(phone) + 1;
+}
+
 function signSession(phone) {
   const body = Buffer.from(
-    JSON.stringify({ p: phone, e: Date.now() + CFG.otp.sessionDays * 864e5 })
+    JSON.stringify({
+      p: phone,
+      e: Date.now() + CFG.otp.sessionDays * 864e5,
+      v: sessionVer(phone),
+    })
   ).toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
   return `${body}.${sig}`;
@@ -3557,7 +3572,10 @@ function readSession(req) {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   try {
     const s = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    const ok = s.e > Date.now() && typeof s.p === 'string' ? s.p : null;
+    const live = s.e > Date.now() && typeof s.p === 'string';
+    // Reject tokens issued before the phone's current session version (revoked).
+    const current = (s.v || 0) >= sessionVer(s.p);
+    const ok = live && current ? s.p : null;
     if (ok) rememberDevicePhone(ok);
     return ok;
   } catch {
@@ -4628,6 +4646,7 @@ async function handleAccountDelete(phone) {
   try { if (state.push) delete state.push[phone]; } catch {}
   try { if (state.consent) delete state.consent[phone]; } catch {}
   try { if (state.waOtp) delete state.waOtp[phone]; } catch {}
+  try { bumpSessionVer(phone); } catch {} // revoke any outstanding token
   try { saveState(); } catch {}
   log('account delete', phone, mode);
   return { ok: true, mode };
